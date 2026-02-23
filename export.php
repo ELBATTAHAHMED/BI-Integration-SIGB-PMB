@@ -3,7 +3,7 @@
 $host = 'localhost';
 $dbname = 'pmb';
 $user = 'root';
-$pass = 'root'; // Modifié selon votre script
+$pass = 'root123'; // Modifié selon votre script
 
 try {
     $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8", $user, $pass);

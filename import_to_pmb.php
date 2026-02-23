@@ -4,7 +4,7 @@ set_time_limit(0);
 $dbHost = 'localhost';
 $dbName = 'pmb';
 $dbUser = 'root';
-$dbPass = 'root';
+$dbPass = 'root123';
 
 // Dossier des CSV
 $baseDir = realpath(__DIR__ . '/CleanedData') . DIRECTORY_SEPARATOR;
@@ -20,6 +20,7 @@ foreach ($csvFiles as $file) {
 }
 
 try {
+    $pdo = null;
     $pdo = new PDO("mysql:host=$dbHost;dbname=$dbName;charset=utf8", $dbUser, $dbPass);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $pdo->beginTransaction();
@@ -28,15 +29,17 @@ try {
     $stmtNotice = $pdo->prepare("INSERT INTO notices (typdoc, tit1, year, npages) VALUES ('a', ?, ?, ?)");
     $stmtExpl   = $pdo->prepare("INSERT INTO exemplaires (expl_notice, expl_cb, expl_cote, expl_statut, expl_location) VALUES (?, ?, ?, 1, 1)");
     $stmtCheckExpl = $pdo->prepare("SELECT COUNT(*) FROM exemplaires WHERE expl_cb = ?");
+    $stmtCheckNoticeCore = $pdo->prepare("SELECT notice_id FROM notices WHERE tit1 = ? AND year = ? AND npages = ? LIMIT 1");
 
-    $stmtAuthor     = $pdo->prepare("INSERT INTO authors (author_name) VALUES (?) ON DUPLICATE KEY UPDATE author_name = VALUES(author_name)");
+    $stmtAuthor     = $pdo->prepare("INSERT INTO authors (author_name) VALUES (?)");
     $stmtFindAuthor = $pdo->prepare("SELECT author_id FROM authors WHERE author_name = ?");
 
-    $stmtPublisher     = $pdo->prepare("INSERT INTO publishers (ed_name, ed_ville) VALUES (?, ?) ON DUPLICATE KEY UPDATE ed_name = VALUES(ed_name), ed_ville = VALUES(ed_ville)");
+    $stmtPublisher     = $pdo->prepare("INSERT INTO publishers (ed_name, ed_ville) VALUES (?, ?)");
     $stmtFindPublisher = $pdo->prepare("SELECT ed_id FROM publishers WHERE ed_name = ?");
     $stmtUpdatePublisherId = $pdo->prepare("UPDATE notices SET ed1_id = ? WHERE notice_id = ?");
 
     $stmtLinkAuthor = $pdo->prepare("INSERT INTO responsability (responsability_notice, responsability_author, responsability_fonction, responsability_type) VALUES (?, ?, '0010', 0)");
+    $stmtCheckLinkAuthor = $pdo->prepare("SELECT COUNT(*) FROM responsability WHERE responsability_notice = ? AND responsability_author = ? AND responsability_fonction = '0010' AND responsability_type = 0");
 
     // Requêtes pour catégories
     $stmtFindCategoryByLabel = $pdo->prepare("SELECT num_noeud FROM categories WHERE libelle_categorie = ?");
@@ -49,6 +52,7 @@ try {
         ) VALUES (?, ?, 'fr_FR', 1, '', '', '', '', '', '')"
     );
     $stmtLinkCategory = $pdo->prepare("INSERT INTO notices_categories (notcateg_notice, num_noeud, num_vedette, ordre_vedette, ordre_categorie) VALUES (?, ?, 0, 1, 0)");
+    $stmtCheckLinkCategory = $pdo->prepare("SELECT COUNT(*) FROM notices_categories WHERE notcateg_notice = ? AND num_noeud = ? AND num_vedette = 0");
 
     // Boucle CSV
     foreach ($csvFiles as $csvFile) {
@@ -59,13 +63,37 @@ try {
             if (count($data) < 9) continue;
             list($cote, $titre, $auteur, $lieu, $edition, $annee, $nbPages, $matiere, $inventaire) = $data;
 
+            $cote = trim((string)$cote);
+            $titre = trim((string)$titre);
+            $auteur = trim((string)$auteur);
+            $lieu = trim((string)$lieu);
+            $edition = trim((string)$edition);
+            $annee = trim((string)$annee);
+            $nbPages = trim((string)$nbPages);
+            $matiere = trim((string)$matiere);
+            $inventaire = trim((string)$inventaire);
+
+            // Eviter les doublons au reimport:
+            // 1) si inventaire existe deja, on saute la ligne
+            if ($inventaire !== '') {
+                $stmtCheckExpl->execute([$inventaire]);
+                if ((int)$stmtCheckExpl->fetchColumn() > 0) {
+                    continue;
+                }
+            } else {
+                // 2) fallback si inventaire vide: verifier noyau notice
+                $stmtCheckNoticeCore->execute([$titre, $annee, $nbPages]);
+                if ($stmtCheckNoticeCore->fetchColumn()) {
+                    continue;
+                }
+            }
+
             // 1️⃣ Notice
             $stmtNotice->execute([$titre, $annee, $nbPages]);
             $noticeId = $pdo->lastInsertId();
 
             // 2️⃣ Exemplaire
-            $stmtCheckExpl->execute([$inventaire]);
-            if ($stmtCheckExpl->fetchColumn() == 0) {
+            if ($inventaire !== '') {
                 $stmtExpl->execute([$noticeId, $inventaire, $cote]);
             }
 
@@ -73,24 +101,39 @@ try {
             foreach (explode(';', $auteur) as $authorName) {
                 $authorName = trim($authorName);
                 if (!$authorName) continue;
-                $stmtAuthor->execute([$authorName]);
-                $authorId = $pdo->lastInsertId() ?: ($stmtFindAuthor->execute([$authorName]) && $stmtFindAuthor->fetchColumn());
+
+                $stmtFindAuthor->execute([$authorName]);
+                $authorId = $stmtFindAuthor->fetchColumn();
+                if (!$authorId) {
+                    $stmtAuthor->execute([$authorName]);
+                    $authorId = $pdo->lastInsertId();
+                }
+
                 if ($authorId) {
-                    $stmtLinkAuthor->execute([$noticeId, $authorId]);
+                    $stmtCheckLinkAuthor->execute([$noticeId, $authorId]);
+                    if ((int)$stmtCheckLinkAuthor->fetchColumn() === 0) {
+                        $stmtLinkAuthor->execute([$noticeId, $authorId]);
+                    }
                 }
             }
 
             // 4️⃣ Éditeur
-            if (trim($edition) !== '') {
-                $stmtPublisher->execute([$edition, $lieu]);
-                $publisherId = $pdo->lastInsertId() ?: ($stmtFindPublisher->execute([$edition]) && $stmtFindPublisher->fetchColumn());
+            if ($edition !== '') {
+                $stmtFindPublisher->execute([$edition]);
+                $publisherId = $stmtFindPublisher->fetchColumn();
+
+                if (!$publisherId) {
+                    $stmtPublisher->execute([$edition, $lieu]);
+                    $publisherId = $pdo->lastInsertId();
+                }
+
                 if ($publisherId) {
                     $stmtUpdatePublisherId->execute([$publisherId, $noticeId]);
                 }
             }
 
             // 5️⃣ Catégorie (matière)
-            if (trim($matiere) !== '') {
+            if ($matiere !== '') {
                 // Nettoyage NBSP + trim
                 $matiere = trim(str_replace("\xc2\xa0", ' ', $matiere));
 
@@ -111,7 +154,10 @@ try {
 
                 if ($categoryId) {
                     // Lier la notice
-                    $stmtLinkCategory->execute([$noticeId, $categoryId]);
+                    $stmtCheckLinkCategory->execute([$noticeId, $categoryId]);
+                    if ((int)$stmtCheckLinkCategory->fetchColumn() === 0) {
+                        $stmtLinkCategory->execute([$noticeId, $categoryId]);
+                    }
                 }
             }
         }
@@ -124,7 +170,7 @@ try {
 
 
 } catch (Exception $e) {
-    if ($pdo->inTransaction()) {
+    if ($pdo instanceof PDO && $pdo->inTransaction()) {
         $pdo->rollBack();
     }
     die("❌ Erreur : " . $e->getMessage());

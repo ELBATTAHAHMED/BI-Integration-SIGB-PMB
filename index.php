@@ -1,858 +1,2428 @@
-<?php
-// Connexion à la base de données PMB
-$host = 'localhost';
-$dbname = 'pmb';
-$user = 'root';
-$pass = 'root'; // Modifié selon votre script
-
-try {
-    $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8", $user, $pass);
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    $dbConnected = true;
-} catch (PDOException $e) {
-    $dbConnected = false;
-    $errorMessage = $e->getMessage();
-}
-
-// Récupération des statistiques de base seulement (optimisé)
-$stats = [];
-if ($dbConnected) {
-    // Nombre total de notices
-    $stmt = $pdo->query("SELECT COUNT(*) as total FROM notices");
-    $stats['total'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
-    
-    // Nombre total d'exemplaires
-    $stmt = $pdo->query("SELECT COUNT(*) as total FROM exemplaires");
-    $stats['exemplaires'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
-    
-    // Nombre total d'auteurs
-    $stmt = $pdo->query("SELECT COUNT(*) as total FROM authors");
-    $stats['auteurs'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
-    
-    // Vérifier si la colonne langue existe dans la table notices
-    $colonneLangueExiste = false;
-    try {
-        $stmt = $pdo->query("SHOW COLUMNS FROM notices LIKE 'langue'");
-        $colonneLangueExiste = $stmt->rowCount() > 0;
-    } catch (PDOException $e) {
-        // La colonne n'existe pas
-    }
-    
-    // Vérifier si la colonne code_langue existe dans la table notices
-    $colonneCodeLangueExiste = false;
-    try {
-        $stmt = $pdo->query("SHOW COLUMNS FROM notices LIKE 'code_langue'");
-        $colonneCodeLangueExiste = $stmt->rowCount() > 0;
-    } catch (PDOException $e) {
-        // La colonne n'existe pas
-    }
-    
-    // Répartition par langue (si la colonne existe)
-    $stats['langues'] = [];
-    if ($colonneLangueExiste) {
-        $stmt = $pdo->query("SELECT langue as code, COUNT(*) as count 
-                             FROM notices 
-                             WHERE langue IS NOT NULL AND langue != '' 
-                             GROUP BY langue 
-                             ORDER BY count DESC");
-        $stats['langues'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    } elseif ($colonneCodeLangueExiste) {
-        $stmt = $pdo->query("SELECT code_langue as code, COUNT(*) as count 
-                             FROM notices 
-                             WHERE code_langue IS NOT NULL AND code_langue != '' 
-                             GROUP BY code_langue 
-                             ORDER BY count DESC");
-        $stats['langues'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    }
-}
-
-// Traitement de la recherche
-$searchResults = [];
-$searchPerformed = false;
-$totalResults = 0;
-$page = isset($_GET['page']) ? (int)$_GET['page'] : 1;
-$perPage = 10; // Réduit pour de meilleures performances
-$offset = ($page - 1) * $perPage;
-
-// Debug des paramètres de recherche
-$debugInfo = [];
-
-if (isset($_GET['q']) || isset($_GET['annee_min']) || isset($_GET['annee_max'])) {
-    $searchPerformed = true;
-    
-    // Vérifier si la colonne langue existe
-    $colonneLangueExiste = false;
-    try {
-        $stmt = $pdo->query("SHOW COLUMNS FROM notices LIKE 'langue'");
-        $colonneLangueExiste = $stmt->rowCount() > 0;
-    } catch (PDOException $e) {
-        // La colonne n'existe pas
-    }
-    
-    // Vérifier si la colonne code_langue existe
-    $colonneCodeLangueExiste = false;
-    try {
-        $stmt = $pdo->query("SHOW COLUMNS FROM notices LIKE 'code_langue'");
-        $colonneCodeLangueExiste = $stmt->rowCount() > 0;
-    } catch (PDOException $e) {
-        // La colonne n'existe pas
-    }
-    
-    // Requête de base avec jointures pour PMB
-    $query = "SELECT n.notice_id, n.tit1 as titre, n.year as annee, n.npages as nb_pages, ";
-    
-    // Ajouter la colonne langue si elle existe
-    if ($colonneLangueExiste) {
-        $query .= "n.langue as langue, ";
-    } elseif ($colonneCodeLangueExiste) {
-        $query .= "n.code_langue as langue, ";
-    } else {
-        $query .= "NULL as langue, ";
-    }
-    
-    $query .= "e.expl_cb as inventaire, e.expl_cote as cote, 
-               a.author_name as auteur, 
-               p.ed_name as edition, p.ed_ville as lieu,
-               c.libelle_categorie as matiere
-        FROM notices n
-        LEFT JOIN exemplaires e ON n.notice_id = e.expl_notice
-        LEFT JOIN responsability r ON n.notice_id = r.responsability_notice
-        LEFT JOIN authors a ON r.responsability_author = a.author_id
-        LEFT JOIN publishers p ON n.ed1_id = p.ed_id
-        LEFT JOIN notices_categories nc ON n.notice_id = nc.notcateg_notice
-        LEFT JOIN categories c ON nc.num_noeud = c.num_noeud
-        WHERE 1=1";
-    
-    $params = [];
-    
-    if (!empty($_GET['q'])) {
-        $searchTerm = '%' . $_GET['q'] . '%';
-        $query .= " AND (n.tit1 LIKE ? OR a.author_name LIKE ? OR e.expl_cote LIKE ?)";
-        $params[] = $searchTerm;
-        $params[] = $searchTerm;
-        $params[] = $searchTerm;
-        $debugInfo[] = "Recherche texte: " . $_GET['q'];
-    }
-    
-    // Correction de la recherche par année
-    if (!empty($_GET['annee_min'])) {
-        $anneeMin = (int)$_GET['annee_min'];
-        $query .= " AND CAST(n.year AS SIGNED) >= ?";
-        $params[] = $anneeMin;
-        $debugInfo[] = "Année min: " . $anneeMin;
-    }
-    
-    if (!empty($_GET['annee_max'])) {
-        $anneeMax = (int)$_GET['annee_max'];
-        $query .= " AND CAST(n.year AS SIGNED) <= ?";
-        $params[] = $anneeMax;
-        $debugInfo[] = "Année max: " . $anneeMax;
-    }
-    
-    // Comptage total pour pagination (optimisé)
-    $countQuery = "SELECT COUNT(DISTINCT n.notice_id) as count FROM notices n
-                  LEFT JOIN exemplaires e ON n.notice_id = e.expl_notice
-                  LEFT JOIN responsability r ON n.notice_id = r.responsability_notice
-                  LEFT JOIN authors a ON r.responsability_author = a.author_id
-                  LEFT JOIN notices_categories nc ON n.notice_id = nc.notcateg_notice
-                  LEFT JOIN categories c ON nc.num_noeud = c.num_noeud
-                  WHERE 1=1";
-    
-    if (!empty($_GET['q'])) {
-        $countQuery .= " AND (n.tit1 LIKE ? OR a.author_name LIKE ? OR e.expl_cote LIKE ?)";
-    }
-    
-    if (!empty($_GET['annee_min'])) {
-        $countQuery .= " AND CAST(n.year AS SIGNED) >= ?";
-    }
-    
-    if (!empty($_GET['annee_max'])) {
-        $countQuery .= " AND CAST(n.year AS SIGNED) <= ?";
-    }
-    
-    $stmt = $pdo->prepare($countQuery);
-    $stmt->execute($params);
-    $totalResults = $stmt->fetch(PDO::FETCH_ASSOC)['count'];
-    
-    // Tri
-    $sortField = isset($_GET['sort']) ? $_GET['sort'] : 'titre';
-    $sortOrder = isset($_GET['order']) ? $_GET['order'] : 'ASC';
-    $allowedFields = ['titre', 'auteur', 'annee'];
-    $allowedOrders = ['ASC', 'DESC'];
-    
-    if (!in_array($sortField, $allowedFields)) $sortField = 'titre';
-    if (!in_array($sortOrder, $allowedOrders)) $sortOrder = 'ASC';
-    
-    // Mapping des champs pour le tri
-    $sortMapping = [
-        'titre' => 'n.tit1',
-        'auteur' => 'a.author_name',
-        'annee' => 'CAST(n.year AS SIGNED)'
-    ];
-    
-    $query .= " GROUP BY n.notice_id ORDER BY " . $sortMapping[$sortField] . " $sortOrder LIMIT $perPage OFFSET $offset";
-    
-    // Exécution de la requête
-    $stmt = $pdo->prepare($query);
-    $stmt->execute($params);
-    $searchResults = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    // Debug de la requête SQL
-    $debugInfo[] = "Requête SQL: " . $query;
-    $debugInfo[] = "Paramètres: " . implode(", ", $params);
-    $debugInfo[] = "Nombre de résultats: " . $totalResults;
-}
-
-// Récupération des années min et max (optimisé)
-$anneeRange = [null, null];
-if ($dbConnected) {
-    $stmt = $pdo->query("SELECT MIN(CAST(year AS SIGNED)) as min_annee, MAX(CAST(year AS SIGNED)) as max_annee FROM notices WHERE year IS NOT NULL AND year > 0");
-    $result = $stmt->fetch(PDO::FETCH_ASSOC);
-    $anneeRange = [$result['min_annee'], $result['max_annee']];
-}
-?>
-
 <!DOCTYPE html>
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bibliothèque Universitaire - Recherche</title>
-    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-    <!-- Optimisé: Chargement sélectif des icônes Font Awesome -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" integrity="sha512-Fo3rlrZj/k7ujTnHg4CGR2D7kSs0v4LLanw2qksYuRlEzO+tcaEPQogQ0KaoGN26/zrn20ImR1DfuLWnOo7aBA==" crossorigin="anonymous" referrerpolicy="no-referrer" />
-    <!-- Optimisé: Chargement différé de Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js" defer></script>
+    <title>Bibliotheque Dashboard</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%9A%3C/text%3E%3C/svg%3E">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
+        :root {
+            --bg: #080b16;
+            --bg-soft: #0e1326;
+            --panel: rgba(18, 25, 45, 0.72);
+            --panel-strong: rgba(14, 19, 35, 0.9);
+            --card: rgba(17, 24, 42, 0.78);
+            --card-hover: rgba(23, 33, 58, 0.9);
+            --text: #f7f9ff;
+            --text-soft: #a9b4d0;
+            --border: rgba(136, 157, 201, 0.2);
+            --border-strong: rgba(136, 157, 201, 0.32);
+            --primary: #4f7cff;
+            --primary-soft: rgba(79, 124, 255, 0.2);
+            --accent: #7f5bff;
+            --success: #37d6a9;
+            --danger: #ff6f91;
+            --shadow: 0 16px 34px rgba(0, 0, 0, 0.35);
+            --radius-lg: 16px;
+            --radius-md: 12px;
+            --radius-sm: 10px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            min-height: 100%;
+            background: var(--bg);
+            color: var(--text);
+            font-family: "Plus Jakarta Sans", sans-serif;
+        }
+
+        body {
+            overflow-x: hidden;
+            background-image:
+                radial-gradient(circle at 12% 10%, rgba(79, 124, 255, 0.28), transparent 35%),
+                radial-gradient(circle at 84% 0%, rgba(127, 91, 255, 0.2), transparent 30%),
+                linear-gradient(180deg, #090d1b 0%, #070a14 100%);
+        }
+
+        body.theme-light {
+            --bg: #f3f6ff;
+            --bg-soft: #e9eefc;
+            --panel: rgba(255, 255, 255, 0.88);
+            --panel-strong: rgba(255, 255, 255, 0.98);
+            --card: rgba(255, 255, 255, 0.94);
+            --card-hover: rgba(255, 255, 255, 1);
+            --text: #1a2740;
+            --text-soft: #5b6c90;
+            --border: rgba(104, 122, 164, 0.25);
+            --border-strong: rgba(104, 122, 164, 0.4);
+            --primary-soft: rgba(79, 124, 255, 0.15);
+            --shadow: 0 12px 24px rgba(43, 66, 112, 0.12);
+            background-image:
+                radial-gradient(circle at 8% 8%, rgba(79, 124, 255, 0.16), transparent 32%),
+                radial-gradient(circle at 90% 4%, rgba(127, 91, 255, 0.12), transparent 28%),
+                linear-gradient(180deg, #f7f9ff 0%, #eef3ff 100%);
+        }
+
+        .app-shell {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .app-header {
+            position: sticky;
+            top: 0;
+            z-index: 60;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            padding: 0.85rem 1rem;
+            background: rgba(8, 11, 22, 0.72);
+            backdrop-filter: blur(14px);
+            border-bottom: 1px solid var(--border);
+        }
+
+        body.theme-light .app-header {
+            background: rgba(247, 250, 255, 0.88);
+        }
+
+        .header-left,
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 0.7rem;
+        }
+
+        .brand-emoji {
+            font-size: 1.5rem;
+            line-height: 1;
+        }
+
+        .brand-title {
+            margin: 0;
+            font-weight: 800;
+            letter-spacing: 0.01em;
+        }
+
+        .brand-sub {
+            margin: 0;
+            color: var(--text-soft);
+            font-size: 0.8rem;
+        }
+
+        .db-total-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.45rem;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            padding: 0.45rem 0.75rem;
+            background: rgba(16, 23, 40, 0.7);
+            color: var(--text-soft);
+            font-size: 0.86rem;
+            white-space: nowrap;
+        }
+
+        body.theme-light .db-total-badge {
+            background: rgba(241, 246, 255, 0.95);
+        }
+
+        .db-total-badge svg {
+            width: 15px;
+            height: 15px;
+            color: var(--primary);
+        }
+
+        .export-btn,
+        .icon-btn,
+        .page-btn,
+        .reset-btn,
+        .order-btn,
+        .lang-btn,
+        select,
+        input {
+            font-family: inherit;
+        }
+
+        .export-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.45rem;
+            border: 1px solid rgba(118, 146, 219, 0.45);
+            background: linear-gradient(135deg, rgba(79, 124, 255, 0.28), rgba(127, 91, 255, 0.22));
+            color: #f2f6ff;
+            border-radius: 10px;
+            padding: 0.55rem 0.9rem;
+            cursor: pointer;
+            transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        body.theme-light .export-btn {
+            color: #243b67;
+            border-color: rgba(97, 123, 182, 0.45);
+            background: linear-gradient(135deg, rgba(79, 124, 255, 0.14), rgba(127, 91, 255, 0.1));
+        }
+
+        .export-btn:hover {
+            transform: translateY(-1px);
+            border-color: rgba(154, 177, 241, 0.7);
+            box-shadow: 0 10px 20px rgba(58, 91, 187, 0.28);
+        }
+
+        .export-btn svg {
+            width: 16px;
+            height: 16px;
+        }
+
+        .icon-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 38px;
+            height: 38px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: rgba(15, 21, 39, 0.85);
+            color: var(--text-soft);
+            cursor: pointer;
+            transition: border-color 0.2s ease, color 0.2s ease, background 0.2s ease;
+        }
+
+        body.theme-light .icon-btn,
+        body.theme-light .order-btn,
+        body.theme-light .page-btn,
+        body.theme-light .lang-btn,
+        body.theme-light .reset-btn,
+        body.theme-light input,
+        body.theme-light select {
+            background: rgba(255, 255, 255, 0.95);
+            color: var(--text);
+        }
+
+        .icon-btn:hover {
+            color: var(--text);
+            border-color: var(--border-strong);
+            background: rgba(20, 28, 50, 0.95);
+        }
+
+        .icon-btn svg {
+            width: 18px;
+            height: 18px;
+        }
+
+        .layout {
+            flex: 1;
+            display: grid;
+            grid-template-columns: 320px minmax(0, 1fr);
+            gap: 1rem;
+            padding: 1rem;
+            width: 100%;
+            transition: grid-template-columns 0.25s ease, gap 0.25s ease;
+        }
+
+        .layout.sidebar-collapsed {
+            grid-template-columns: 0 minmax(0, 1fr);
+            gap: 0;
+        }
+
+        .sidebar {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(12px);
+            padding: 1rem;
+            height: calc(100vh - 5.2rem);
+            position: sticky;
+            top: 4.2rem;
+            overflow: auto;
+            transition: transform 0.25s ease, opacity 0.25s ease;
+        }
+
+        .layout.sidebar-collapsed .sidebar {
+            transform: translateX(-110%);
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        body.theme-light .sidebar {
+            box-shadow: 0 12px 26px rgba(50, 76, 128, 0.12);
+        }
+
+        .sidebar-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+
+        .sidebar-title {
+            margin: 0;
+            font-size: 1rem;
+            letter-spacing: 0.01em;
+        }
+
+        .filter-group {
+            margin-bottom: 1rem;
+        }
+
+        .filter-group > label,
+        .group-label {
+            display: block;
+            margin-bottom: 0.45rem;
+            font-size: 0.8rem;
+            color: var(--text-soft);
+            letter-spacing: 0.02em;
+        }
+
+        .input-wrap {
+            position: relative;
+        }
+
+        .input-wrap svg {
+            position: absolute;
+            width: 16px;
+            height: 16px;
+            left: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #7f8eb0;
+        }
+
+        body.theme-light .input-wrap svg {
+            color: #6780b1;
+        }
+
+        input,
+        select {
+            width: 100%;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+            background: rgba(13, 19, 35, 0.95);
+            color: var(--text);
+            padding: 0.62rem 0.7rem;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        input:focus,
+        select:focus {
+            outline: none;
+            border-color: rgba(110, 147, 255, 0.8);
+            box-shadow: 0 0 0 3px var(--primary-soft);
+        }
+
+        #searchInput {
+            padding-left: 2rem;
+        }
+
+        .language-buttons {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.45rem;
+        }
+
+        .lang-btn {
+            border: 1px solid var(--border);
+            background: rgba(12, 17, 32, 0.92);
+            border-radius: 10px;
+            color: var(--text-soft);
+            padding: 0.5rem 0.35rem;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.35rem;
+            transition: all 0.2s ease;
+        }
+
+        .lang-btn:hover {
+            border-color: var(--border-strong);
+            color: var(--text);
+        }
+
+        .lang-btn.active {
+            background: linear-gradient(140deg, rgba(79, 124, 255, 0.28), rgba(127, 91, 255, 0.18));
+            border-color: rgba(129, 163, 255, 0.8);
+            color: #f2f6ff;
+            box-shadow: inset 0 0 0 1px rgba(145, 176, 255, 0.25);
+        }
+
+        body.theme-light .lang-btn.active {
+            color: #244177;
+            border-color: rgba(95, 127, 199, 0.62);
+            background: linear-gradient(140deg, rgba(79, 124, 255, 0.18), rgba(127, 91, 255, 0.12));
+        }
+
+        .year-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.45rem;
+        }
+
+        .year-grid label {
+            display: block;
+            font-size: 0.74rem;
+            color: #94a4c9;
+            margin-bottom: 0.2rem;
+        }
+
+        body.theme-light .year-grid label {
+            color: #5f78a9;
+        }
+
+        .year-hint {
+            margin-top: 0.4rem;
+            color: #8ea0ca;
+            font-size: 0.75rem;
+        }
+
+        body.theme-light .year-hint,
+        body.theme-light .group-label,
+        body.theme-light .filter-group > label {
+            color: #6176a3;
+        }
+
+        .sort-row {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 0.45rem;
+            align-items: center;
+        }
+
+        .order-btn {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: rgba(13, 19, 35, 0.95);
+            color: var(--text);
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.35rem;
+            padding: 0.62rem 0.7rem;
+            min-width: 92px;
+            transition: border-color 0.2s ease, transform 0.2s ease;
+        }
+
+        .order-btn:hover {
+            border-color: var(--border-strong);
+            transform: translateY(-1px);
+        }
+
+        .reset-btn {
+            width: 100%;
+            margin-top: 0.4rem;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.45rem;
+            border: 1px dashed rgba(255, 255, 255, 0.28);
+            border-radius: 10px;
+            background: rgba(12, 17, 30, 0.75);
+            color: #d3dcf3;
+            padding: 0.66rem 0.8rem;
+            cursor: pointer;
+            transition: background 0.2s ease, border-color 0.2s ease;
+        }
+
+        body.theme-light .reset-btn {
+            color: #35517f;
+            border-color: rgba(100, 122, 171, 0.45);
+            background: rgba(255, 255, 255, 0.95);
+        }
+
+        .reset-btn:hover {
+            border-color: rgba(255, 255, 255, 0.46);
+            background: rgba(18, 25, 43, 0.95);
+        }
+
+        body.theme-light .reset-btn:hover {
+            border-color: rgba(88, 113, 166, 0.55);
+            background: rgba(236, 243, 255, 0.96);
+        }
+
+        .reset-btn svg {
+            width: 16px;
+            height: 16px;
+        }
+
+        .main-content {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.9rem;
+        }
+
+        .stats-strip {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.65rem;
+        }
+
+        .stat-chip {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 0.75rem 0.8rem;
+            min-height: 72px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            transition: border-color 0.2s ease, transform 0.2s ease;
+        }
+
+        .stat-chip:hover {
+            border-color: var(--border-strong);
+            transform: translateY(-1px);
+        }
+
+        .stat-chip.primary {
+            border-color: var(--border);
+            background: var(--panel);
+        }
+
+        body.theme-light .stat-chip.primary {
+            background: var(--panel);
+        }
+
+        .chip-label {
+            color: #8fa2cb;
+            font-size: 0.76rem;
+            margin-bottom: 0.32rem;
+        }
+
+        body.theme-light .chip-label {
+            color: #5f74a1;
+        }
+
+        .chip-value {
+            font-size: 1.05rem;
+            font-weight: 700;
+            line-height: 1.2;
+            word-break: break-word;
+        }
+
+        .results-meta {
+            color: var(--text-soft);
+            font-size: 0.86rem;
+            min-height: 20px;
+        }
+
+        body.theme-light .results-meta,
+        body.theme-light .meta-muted {
+            color: #5d739f;
+        }
+
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.65rem;
+        }
+
         .book-card {
-            transition: transform 0.2s ease;
+            position: relative;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 0.72rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+            min-height: 236px;
+            transition: transform 0.24s ease, border-color 0.24s ease, background 0.24s ease;
+            overflow: hidden;
         }
+
+        .book-card::before {
+            content: "";
+            position: absolute;
+            inset: -40% auto auto -25%;
+            width: 130px;
+            height: 130px;
+            background: radial-gradient(circle, rgba(79, 124, 255, 0.14), transparent 70%);
+            pointer-events: none;
+        }
+
+        body.theme-light .book-card::before {
+            background: radial-gradient(circle, rgba(79, 124, 255, 0.2), transparent 72%);
+        }
+
         .book-card:hover {
-            transform: translateY(-3px);
+            transform: translateY(-4px);
+            border-color: rgba(146, 173, 238, 0.46);
+            background: var(--card-hover);
         }
-        .dark {
-            background-color: #1a202c;
-            color: #e2e8f0;
+
+        .book-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 0.42rem;
         }
-        .dark .book-card, .dark .bg-white {
-            background-color: #2d3748;
+
+        .inventory-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 58px;
+            max-width: 130px;
+            flex-shrink: 0;
+            padding: 0.16rem 0.45rem;
+            border-radius: 999px;
+            border: 1px solid rgba(79, 124, 255, 0.38);
+            background: rgba(79, 124, 255, 0.16);
+            color: #dce8ff;
+            font-size: 0.72rem;
+            font-weight: 600;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
-        .dark .text-gray-700, .dark .text-gray-800 {
-            color: #e2e8f0;
+
+        .cote-badge,
+        .lang-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.28rem;
+            padding: 0.18rem 0.5rem;
+            border-radius: 999px;
+            border: 1px solid rgba(136, 157, 201, 0.3);
+            background: rgba(15, 21, 38, 0.85);
+            font-size: 0.72rem;
+            color: #c8d3ef;
+            white-space: nowrap;
         }
-        .dark .text-gray-600, .dark .text-gray-500 {
-            color: #cbd5e0;
+
+        .lang-badge {
+            border-color: rgba(127, 91, 255, 0.45);
+            color: #d8ceff;
         }
-        .dark .border-gray-200 {
-            border-color: #4a5568;
+
+        body.theme-light .cote-badge,
+        body.theme-light .lang-badge {
+            background: rgba(244, 247, 255, 0.95);
+            color: #48629b;
         }
-        .dark .bg-gray-100, .dark .bg-gray-50 {
-            background-color: #4a5568;
+
+        body.theme-light .lang-badge {
+            color: #674daf;
+        }
+
+        body.theme-light .inventory-badge {
+            color: #254a9d;
+            background: rgba(79, 124, 255, 0.12);
+        }
+
+        body.theme-light .book-inline-item,
+        body.theme-light .book-author svg,
+        body.theme-light .book-inline-item svg {
+            color: #6078ac;
+        }
+
+        body.theme-light .details-btn {
+            color: #1f2d4c;
+            border-color: rgba(110, 91, 205, 0.45);
+            background: linear-gradient(130deg, rgba(127, 91, 255, 0.12), rgba(79, 124, 255, 0.1));
+        }
+
+        .book-title {
+            margin: 0;
+            font-size: 0.95rem;
+            line-height: 1.3;
+            font-weight: 700;
+            color: #f7faff;
+            min-height: 2.5em;
+            flex: 1;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        body.theme-light .book-title {
+            color: #1f3155;
+        }
+
+        .book-author {
+            margin: 0;
+            color: var(--text-soft);
+            font-size: 0.86rem;
+            min-height: 1.2em;
+            display: flex;
+            align-items: center;
+            gap: 0.28rem;
+            overflow: hidden;
+        }
+
+        .book-author span {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .book-author svg {
+            width: 14px;
+            height: 14px;
+            color: #88a0d2;
+            flex-shrink: 0;
+        }
+
+        .book-meta-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.22rem;
+            margin-top: 0.15rem;
+        }
+
+        .book-info-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.34rem 0.45rem;
+            margin-top: 0.05rem;
+        }
+
+        .book-inline-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.26rem;
+            color: #9caed3;
+            font-size: 0.75rem;
+            min-width: 0;
+            overflow: hidden;
+        }
+
+        .book-inline-item span {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .book-inline-item svg {
+            width: 14px;
+            height: 14px;
+            color: #89a0d0;
+            flex-shrink: 0;
+        }
+
+        .book-meta-item {
+            color: #96a7cd;
+            font-size: 0.77rem;
+            line-height: 1.35;
+            display: -webkit-box;
+            -webkit-line-clamp: 1;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        body.theme-light .book-meta-item {
+            color: #5c709b;
+        }
+
+        .book-meta-item strong {
+            color: #c9d5f2;
+            font-weight: 600;
+        }
+
+        body.theme-light .book-meta-item strong {
+            color: #31496f;
+        }
+
+        .book-bottom {
+            margin-top: auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.4rem;
+            flex-wrap: wrap;
+            padding-top: 0.45rem;
+            border-top: 1px dashed rgba(136, 157, 201, 0.18);
+        }
+
+        body.theme-light .book-bottom {
+            border-top-color: rgba(101, 123, 168, 0.24);
+        }
+
+        .book-footer-left {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            flex-wrap: wrap;
+            min-width: 0;
+        }
+
+        .book-actions {
+            display: flex;
+            justify-content: flex-end;
+        }
+
+        .details-btn {
+            border: 1px solid rgba(127, 91, 255, 0.55);
+            background: linear-gradient(130deg, rgba(127, 91, 255, 0.22), rgba(79, 124, 255, 0.2));
+            color: #efe8ff;
+            border-radius: 9px;
+            padding: 0.38rem 0.62rem;
+            font-size: 0.77rem;
+            cursor: pointer;
+            transition: border-color 0.2s ease, transform 0.2s ease, background 0.2s ease;
+        }
+
+        .details-btn svg {
+            width: 14px;
+            height: 14px;
+            margin-right: 0.22rem;
+            vertical-align: text-bottom;
+        }
+
+        .details-btn:hover {
+            transform: translateY(-1px);
+            border-color: rgba(165, 134, 255, 0.75);
+            background: linear-gradient(130deg, rgba(127, 91, 255, 0.3), rgba(79, 124, 255, 0.28));
+        }
+
+        .details-btn:focus-visible {
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(127, 91, 255, 0.3);
+        }
+
+        .meta-muted {
+            color: #9aaace;
+            font-size: 0.78rem;
+            white-space: nowrap;
+        }
+
+        .matiere-chip {
+            max-width: 100%;
+            border: 1px solid rgba(79, 124, 255, 0.42);
+            background: rgba(79, 124, 255, 0.15);
+            color: #dbe7ff;
+            border-radius: 999px;
+            padding: 0.18rem 0.5rem;
+            font-size: 0.73rem;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        body.theme-light .matiere-chip {
+            color: #2e4d87;
+            background: rgba(79, 124, 255, 0.12);
+        }
+
+        .rtl-text {
+            direction: rtl;
+            text-align: right;
+        }
+
+        .pagination {
+            margin-top: 0.25rem;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 0.7rem;
+            padding-bottom: 0.35rem;
+        }
+
+        .page-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            border: 1px solid var(--border);
+            background: rgba(13, 18, 31, 0.88);
+            color: var(--text);
+            border-radius: 10px;
+            padding: 0.48rem 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .page-btn:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+
+        .page-btn:not(:disabled):hover {
+            border-color: var(--border-strong);
+            transform: translateY(-1px);
+            background: rgba(20, 28, 50, 0.95);
+        }
+
+        body.theme-light .page-btn:not(:disabled):hover {
+            background: rgba(236, 242, 255, 0.96);
+        }
+
+        .page-btn svg {
+            width: 16px;
+            height: 16px;
+        }
+
+        .page-info {
+            color: var(--text-soft);
+            font-size: 0.88rem;
+            min-width: 130px;
+            text-align: center;
+        }
+
+        .detailed-stats {
+            margin-top: 0.4rem;
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            background: rgba(12, 18, 33, 0.72);
+            padding: 0.85rem;
+        }
+
+        body.theme-light .detailed-stats {
+            background: rgba(255, 255, 255, 0.9);
+        }
+
+        .detailed-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.8rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .detailed-title {
+            margin: 0;
+            font-size: 0.98rem;
+            font-weight: 700;
+        }
+
+        .load-charts-btn {
+            border: 1px solid rgba(118, 146, 219, 0.45);
+            background: linear-gradient(135deg, rgba(79, 124, 255, 0.24), rgba(127, 91, 255, 0.2));
+            color: #eff4ff;
+            border-radius: 10px;
+            padding: 0.5rem 0.72rem;
+            font-size: 0.8rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            cursor: pointer;
+            transition: transform 0.2s ease, border-color 0.2s ease;
+        }
+
+        body.theme-light .load-charts-btn {
+            color: #29406c;
+            border-color: rgba(97, 123, 182, 0.45);
+            background: linear-gradient(135deg, rgba(79, 124, 255, 0.14), rgba(127, 91, 255, 0.1));
+        }
+
+        .load-charts-btn:hover {
+            transform: translateY(-1px);
+            border-color: rgba(154, 177, 241, 0.7);
+        }
+
+        .load-charts-btn svg {
+            width: 15px;
+            height: 15px;
+        }
+
+        .detailed-counters {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.5rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .detailed-counter {
+            border: 1px solid rgba(126, 145, 181, 0.25);
+            border-radius: 10px;
+            background: rgba(10, 15, 29, 0.82);
+            padding: 0.6rem 0.65rem;
+        }
+
+        body.theme-light .detailed-counter,
+        body.theme-light .chart-card,
+        body.theme-light .modal-item {
+            background: rgba(248, 251, 255, 0.97);
+        }
+
+        .detailed-counter .label {
+            display: block;
+            color: #90a2cb;
+            font-size: 0.73rem;
+            margin-bottom: 0.24rem;
+        }
+
+        .detailed-counter .value {
+            color: #f5f8ff;
+            font-size: 0.9rem;
+            font-weight: 700;
+            line-height: 1.2;
+            word-break: break-word;
+        }
+
+        body.theme-light .detailed-counter .value {
+            color: #233757;
+        }
+
+        .charts-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.6rem;
+        }
+
+        .chart-card {
+            border: 1px solid rgba(126, 145, 181, 0.24);
+            border-radius: 11px;
+            background: rgba(11, 17, 31, 0.85);
+            padding: 0.65rem;
+        }
+
+        .chart-title {
+            margin: 0 0 0.55rem;
+            color: #c9d7f5;
+            font-size: 0.84rem;
+            font-weight: 600;
+        }
+
+        body.theme-light .chart-title {
+            color: #3f5687;
+        }
+
+        .bar-chart-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
+            max-height: 290px;
+            overflow: auto;
+            padding-right: 0.15rem;
+        }
+
+        .bar-row {
+            display: grid;
+            grid-template-columns: minmax(72px, 130px) 1fr auto;
+            align-items: center;
+            gap: 0.4rem;
+            font-size: 0.74rem;
+            color: #c9d6f2;
+        }
+
+        .bar-label {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .bar-track {
+            width: 100%;
+            height: 8px;
+            border-radius: 999px;
+            background: rgba(126, 145, 181, 0.2);
+            overflow: hidden;
+        }
+
+        .bar-fill {
+            height: 100%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, rgba(79, 124, 255, 0.9), rgba(127, 91, 255, 0.9));
+        }
+
+        .bar-count {
+            color: #9fb1d8;
+            min-width: 38px;
+            text-align: right;
+        }
+
+        .line-chart-wrap {
+            height: 290px;
+            position: relative;
+            border: 1px solid rgba(126, 145, 181, 0.2);
+            border-radius: 10px;
+            background: rgba(8, 12, 25, 0.8);
+            overflow: hidden;
+        }
+
+        body.theme-light .line-chart-wrap {
+            background: rgba(255, 255, 255, 0.95);
+        }
+
+        .line-chart-wrap svg {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        .line-chart-wrap canvas {
+            width: 100% !important;
+            height: 100% !important;
+            display: block;
+        }
+
+        .chart-empty {
+            color: #90a2cb;
+            font-size: 0.82rem;
+            text-align: center;
+            padding: 2rem 0.5rem;
+        }
+
+        .empty-state {
+            border: 1px dashed rgba(138, 155, 191, 0.35);
+            border-radius: 14px;
+            background: rgba(12, 17, 31, 0.7);
+            text-align: center;
+            padding: 2rem 1rem;
+        }
+
+        body.theme-light .empty-state {
+            background: rgba(255, 255, 255, 0.92);
+            border-color: rgba(103, 124, 171, 0.3);
+        }
+
+        .empty-state h3 {
+            margin: 0.55rem 0 0.25rem;
+            font-size: 1rem;
+        }
+
+        .empty-state p {
+            margin: 0;
+            color: var(--text-soft);
+            font-size: 0.88rem;
+        }
+
+        .empty-icon {
+            font-size: 2rem;
+            line-height: 1;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(4, 8, 16, 0.66);
+            backdrop-filter: blur(4px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+            z-index: 90;
+        }
+
+        .modal-card {
+            width: min(780px, 100%);
+            border: 1px solid var(--border-strong);
+            background: var(--panel-strong);
+            border-radius: 16px;
+            box-shadow: 0 26px 48px rgba(0, 0, 0, 0.45);
+            overflow: hidden;
+        }
+
+        body.theme-light .modal-overlay {
+            background: rgba(18, 35, 74, 0.28);
+        }
+
+        .modal-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.8rem;
+            padding: 0.9rem 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .modal-title {
+            margin: 0;
+            font-size: 1.02rem;
+            font-weight: 700;
+        }
+
+        .modal-close {
+            border: 1px solid var(--border);
+            background: rgba(16, 22, 38, 0.8);
+            color: var(--text-soft);
+            border-radius: 10px;
+            width: 36px;
+            height: 36px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+        }
+
+        body.theme-light .modal-close {
+            background: rgba(255, 255, 255, 0.95);
+            color: #5c729f;
+        }
+
+        .modal-close:hover {
+            color: var(--text);
+            border-color: var(--border-strong);
+        }
+
+        .modal-close svg {
+            width: 16px;
+            height: 16px;
+        }
+
+        .modal-body {
+            padding: 1rem;
+        }
+
+        .modal-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.6rem;
+        }
+
+        .modal-item {
+            border: 1px solid rgba(126, 145, 181, 0.25);
+            border-radius: 10px;
+            background: rgba(12, 18, 34, 0.86);
+            padding: 0.65rem 0.75rem;
+        }
+
+        .modal-label {
+            display: block;
+            color: #91a1c8;
+            font-size: 0.73rem;
+            margin-bottom: 0.26rem;
+        }
+
+        body.theme-light .modal-label {
+            color: #6078a9;
+        }
+
+        .modal-value {
+            color: #f5f8ff;
+            font-size: 0.9rem;
+            line-height: 1.35;
+            word-break: break-word;
+        }
+
+        body.theme-light .modal-value {
+            color: #233b61;
+        }
+
+        .skeleton-card {
+            background: rgba(13, 18, 33, 0.9);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 0.8rem;
+            min-height: 178px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        body.theme-light .skeleton-card {
+            background: rgba(255, 255, 255, 0.95);
+        }
+
+        .skeleton-line {
+            border-radius: 8px;
+            height: 10px;
+            margin-bottom: 0.45rem;
+            background: linear-gradient(90deg, rgba(95, 110, 145, 0.15) 25%, rgba(139, 157, 198, 0.35) 50%, rgba(95, 110, 145, 0.15) 75%);
+            background-size: 220% 100%;
+            animation: shimmer 1.2s linear infinite;
+        }
+
+        body.theme-light .skeleton-line {
+            background: linear-gradient(90deg, rgba(188, 203, 236, 0.3) 25%, rgba(131, 156, 212, 0.5) 50%, rgba(188, 203, 236, 0.3) 75%);
+        }
+
+        .skeleton-line.short { width: 38%; }
+        .skeleton-line.medium { width: 62%; }
+        .skeleton-line.long { width: 90%; }
+
+        @keyframes shimmer {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        .sidebar-overlay {
+            display: none;
+        }
+
+        .mobile-only {
+            display: none;
+        }
+
+        @media (max-width: 1160px) {
+            .stats-strip {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            .results-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            .detailed-counters {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            .charts-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 980px) {
+            .mobile-only {
+                display: inline-flex;
+            }
+
+            .layout {
+                grid-template-columns: 1fr;
+            }
+
+            .sidebar {
+                position: fixed;
+                top: 0;
+                left: 0;
+                height: 100vh;
+                width: min(86vw, 320px);
+                border-radius: 0 16px 16px 0;
+                transform: translateX(-108%);
+                transition: transform 0.25s ease;
+                z-index: 80;
+                padding-top: 1.2rem;
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .sidebar-overlay {
+                position: fixed;
+                inset: 0;
+                background: rgba(2, 6, 14, 0.55);
+                z-index: 70;
+                backdrop-filter: blur(2px);
+            }
+
+            .sidebar-overlay.visible {
+                display: block;
+            }
+
+            .app-header {
+                padding: 0.7rem 0.8rem;
+            }
+
+            .db-total-badge {
+                display: none;
+            }
+
+            .export-btn {
+                padding: 0.5rem 0.68rem;
+                font-size: 0.83rem;
+            }
+        }
+
+        @media (max-width: 620px) {
+            .stats-strip {
+                grid-template-columns: 1fr;
+            }
+
+            .results-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .brand-sub {
+                display: none;
+            }
+
+            .detailed-head {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .detailed-counters {
+                grid-template-columns: 1fr;
+            }
+
+            .bar-row {
+                grid-template-columns: minmax(62px, 100px) 1fr auto;
+            }
+
+            .modal-grid {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
-<body class="min-h-screen bg-gray-50 transition-colors duration-200">
-    <header class="bg-gradient-to-r from-blue-600 to-indigo-700 text-white shadow-lg">
-        <div class="container mx-auto px-4 py-6">
-            <div class="flex flex-col md:flex-row justify-between items-center">
-                <div class="flex items-center mb-4 md:mb-0">
-                    <i class="fas fa-book-open text-3xl mr-3"></i>
-                    <h1 class="text-2xl md:text-3xl font-bold">Bibliothèque Universitaire</h1>
-                </div>
-                <div class="flex items-center space-x-4">
-                    <button id="darkModeToggle" class="p-2 rounded-full hover:bg-blue-500 transition-colors">
-                        <i class="fas fa-moon"></i>
-                    </button>
-                    <a href="#statistiques" class="px-4 py-2 rounded-lg bg-white bg-opacity-20 hover:bg-opacity-30 transition-colors">
-                        <i class="fas fa-chart-bar mr-2"></i>Statistiques
-                    </a>
+<body>
+    <div class="app-shell">
+        <header class="app-header">
+            <div class="header-left">
+                <button id="openSidebarBtn" class="icon-btn" aria-label="Open filters">
+                    <i data-lucide="panel-left"></i>
+                </button>
+                <div class="brand">
+                    <span class="brand-emoji">📚</span>
+                    <div>
+                        <p class="brand-title">Bibliothèque</p>
+                        <p class="brand-sub">Dashboard PMB</p>
+                    </div>
                 </div>
             </div>
-        </div>
-    </header>
+            <div class="header-right">
+                <div class="db-total-badge">
+                    <i data-lucide="database"></i>
+                    <span id="dbTotalCount">Chargement...</span>
+                </div>
+                <button id="themeToggleBtn" class="icon-btn" aria-label="Changer le thème">
+                    <i data-lucide="sun"></i>
+                </button>
+                <button id="exportBtn" class="export-btn">
+                    <i data-lucide="download"></i>
+                    Export CSV
+                </button>
+            </div>
+        </header>
 
-    <main class="container mx-auto px-4 py-8">
-        <?php if (!$dbConnected): ?>
-            <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 mb-6" role="alert">
-                <p class="font-bold">Erreur de connexion à la base de données</p>
-                <p><?php echo $errorMessage; ?></p>
-            </div>
-        <?php else: ?>
-            <!-- Formulaire de recherche -->
-            <div class="bg-white rounded-lg shadow-md p-6 mb-8">
-                <h2 class="text-xl font-semibold mb-4 text-gray-800">Recherche de livres</h2>
-                <form action="" method="GET" class="space-y-4">
-                    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
-                        <div class="md:col-span-2">
-                            <label for="q" class="block text-sm font-medium text-gray-700 mb-1">Recherche par titre, auteur ou cote</label>
-                            <div class="relative">
-                                <input type="text" id="q" name="q" value="<?php echo isset($_GET['q']) ? htmlspecialchars($_GET['q']) : ''; ?>" 
-                                    class="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500">
-                                <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                                    <i class="fas fa-search text-gray-400"></i>
-                                </div>
-                            </div>
+        <div id="mainLayout" class="layout">
+            <aside id="sidebar" class="sidebar" aria-label="Filters">
+                <div class="sidebar-head">
+                    <h2 class="sidebar-title">Filtres live</h2>
+                    <button id="closeSidebarBtn" class="icon-btn" aria-label="Close filters">
+                        <i data-lucide="x"></i>
+                    </button>
+                </div>
+
+                <div class="filter-group">
+                    <label for="searchInput">Recherche</label>
+                    <div class="input-wrap">
+                        <i data-lucide="search"></i>
+                        <input type="text" id="searchInput" placeholder="Titre, auteur, cote..." autocomplete="off">
+                    </div>
+                </div>
+
+                <div class="filter-group">
+                    <span class="group-label">Langue</span>
+                    <div id="languageButtons" class="language-buttons">
+                        <button type="button" class="lang-btn" data-lang="fr">French</button>
+                        <button type="button" class="lang-btn" data-lang="en">English</button>
+                        <button type="button" class="lang-btn" data-lang="ar">Arabic</button>
+                    </div>
+                </div>
+
+                <div class="filter-group">
+                    <label for="matiereSelect">Matiere</label>
+                    <select id="matiereSelect">
+                        <option value="">Toutes les matieres</option>
+                    </select>
+                </div>
+
+                <div class="filter-group">
+                    <span class="group-label">Annee de publication</span>
+                    <div class="year-grid">
+                        <div>
+                            <label for="yearMin">Min</label>
+                            <input id="yearMin" type="number" inputmode="numeric" placeholder="Min">
                         </div>
-                        <div class="md:col-span-2">
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Année de publication</label>
-                            <div class="grid grid-cols-2 gap-2">
-                                <div>
-                                    <input type="number" id="annee_min" name="annee_min" placeholder="Min" min="<?php echo $anneeRange[0]; ?>" max="<?php echo $anneeRange[1]; ?>" 
-                                        value="<?php echo isset($_GET['annee_min']) ? htmlspecialchars($_GET['annee_min']) : ''; ?>" 
-                                        class="block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500">
-                                </div>
-                                <div>
-                                    <input type="number" id="annee_max" name="annee_max" placeholder="Max" min="<?php echo $anneeRange[0]; ?>" max="<?php echo $anneeRange[1]; ?>" 
-                                        value="<?php echo isset($_GET['annee_max']) ? htmlspecialchars($_GET['annee_max']) : ''; ?>" 
-                                        class="block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500">
-                                </div>
-                            </div>
+                        <div>
+                            <label for="yearMax">Max</label>
+                            <input id="yearMax" type="number" inputmode="numeric" placeholder="Max">
                         </div>
                     </div>
-                    
-                    <div class="flex justify-between items-center">
-                        <div>
-                            <label for="sort" class="text-sm font-medium text-gray-700 mr-2">Trier par:</label>
-                            <select id="sort" name="sort" class="py-1 px-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500">
-                                <option value="titre" <?php echo (isset($_GET['sort']) && $_GET['sort'] === 'titre') ? 'selected' : ''; ?>>Titre</option>
-                                <option value="auteur" <?php echo (isset($_GET['sort']) && $_GET['sort'] === 'auteur') ? 'selected' : ''; ?>>Auteur</option>
-                                <option value="annee" <?php echo (isset($_GET['sort']) && $_GET['sort'] === 'annee') ? 'selected' : ''; ?>>Année</option>
-                            </select>
-                            <select id="order" name="order" class="ml-2 py-1 px-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500">
-                                <option value="ASC" <?php echo (!isset($_GET['order']) || $_GET['order'] === 'ASC') ? 'selected' : ''; ?>>Croissant</option>
-                                <option value="DESC" <?php echo (isset($_GET['order']) && $_GET['order'] === 'DESC') ? 'selected' : ''; ?>>Décroissant</option>
-                            </select>
-                        </div>
-                        <button type="submit" class="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
-                            <i class="fas fa-search mr-2"></i>Rechercher
+                    <div id="yearHint" class="year-hint">Plage: --</div>
+                </div>
+
+                <div class="filter-group">
+                    <label for="sortField">Trier par</label>
+                    <div class="sort-row">
+                        <select id="sortField">
+                            <option value="titre">Titre</option>
+                            <option value="auteur">Auteur</option>
+                            <option value="annee">Annee</option>
+                        </select>
+                        <button id="orderToggle" type="button" class="order-btn">
+                            <span id="orderArrow">↑</span>
+                            <span id="orderLabel">ASC</span>
                         </button>
                     </div>
-                </form>
-            </div>
-
-            <!-- Résultats de recherche -->
-            <?php if ($searchPerformed): ?>
-                <div class="mb-8">
-                    <div class="flex justify-between items-center mb-4">
-                        <h2 class="text-xl font-semibold text-gray-800">
-                            <?php echo $totalResults; ?> résultat<?php echo $totalResults > 1 ? 's' : ''; ?> trouvé<?php echo $totalResults > 1 ? 's' : ''; ?>
-                        </h2>
-                        <?php if ($totalResults > 0): ?>
-                            <div class="text-sm text-gray-500">
-                                Affichage de <?php echo min($offset + 1, $totalResults); ?> à <?php echo min($offset + $perPage, $totalResults); ?> sur <?php echo $totalResults; ?>
-                            </div>
-                        <?php endif; ?>
-                    </div>
-
-                    <?php if (count($searchResults) > 0): ?>
-                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                            <?php foreach ($searchResults as $livre): ?>
-                                <div class="book-card bg-white rounded-lg shadow-md overflow-hidden border border-gray-200">
-                                    <div class="p-4">
-                                        <div class="flex justify-between items-start">
-                                            <h3 class="text-lg font-semibold text-gray-800 mb-2"><?php echo htmlspecialchars($livre['titre']); ?></h3>
-                                            <span class="px-2 py-1 text-xs font-semibold rounded-full bg-blue-100 text-blue-800">
-                                                <?php echo !empty($livre['inventaire']) ? htmlspecialchars(substr($livre['inventaire'], 0, 5)) : 'N/A'; ?>
-                                            </span>
-                                        </div>
-                                        <p class="text-gray-600 mb-2">
-                                            <i class="fas fa-user text-gray-400 mr-1"></i> 
-                                            <?php echo !empty($livre['auteur']) ? htmlspecialchars($livre['auteur']) : '<span class="text-gray-400 italic">Auteur inconnu</span>'; ?>
-                                        </p>
-                                        <div class="flex justify-between text-sm text-gray-500 mb-2">
-                                            <span>
-                                                <i class="fas fa-map-marker-alt mr-1"></i> 
-                                                <?php echo !empty($livre['lieu']) ? htmlspecialchars($livre['lieu']) : 'N/A'; ?>
-                                            </span>
-                                            <span>
-                                                <i class="fas fa-calendar-alt mr-1"></i> 
-                                                <?php echo !empty($livre['annee']) ? htmlspecialchars($livre['annee']) : 'N/A'; ?>
-                                            </span>
-                                        </div>
-                                        <div class="flex justify-between text-sm">
-                                            <span class="text-gray-500">
-                                                <i class="fas fa-bookmark mr-1"></i> 
-                                                <?php echo !empty($livre['matiere']) ? htmlspecialchars($livre['matiere']) : 'N/A'; ?>
-                                            </span>
-                                            <span class="text-gray-500">
-                                                <i class="fas fa-file-alt mr-1"></i> 
-                                                <?php echo !empty($livre['nb_pages']) ? htmlspecialchars($livre['nb_pages']) . ' p.' : 'N/A'; ?>
-                                            </span>
-                                        </div>
-                                    </div>
-                                    <div class="bg-gray-50 px-4 py-3 border-t border-gray-200">
-                                        <div class="flex justify-between items-center">
-                                            <span class="text-sm font-medium text-gray-500">
-                                                <i class="fas fa-barcode mr-1"></i> <?php echo !empty($livre['cote']) ? htmlspecialchars($livre['cote']) : 'N/A'; ?>
-                                            </span>
-                                            <button class="text-indigo-600 hover:text-indigo-800" 
-                                                    onclick="showDetails('<?php echo addslashes(htmlspecialchars($livre['titre'])); ?>', '<?php echo addslashes(htmlspecialchars($livre['auteur'])); ?>', '<?php echo addslashes(htmlspecialchars($livre['cote'])); ?>', '<?php echo addslashes(htmlspecialchars($livre['lieu'])); ?>', '<?php echo addslashes(htmlspecialchars($livre['edition'])); ?>', '<?php echo addslashes(htmlspecialchars($livre['annee'])); ?>', '<?php echo addslashes(htmlspecialchars($livre['nb_pages'])); ?>', '<?php echo addslashes(htmlspecialchars($livre['matiere'])); ?>', '<?php echo addslashes(htmlspecialchars($livre['inventaire'])); ?>', '<?php echo isset($livre['langue']) ? addslashes(htmlspecialchars($livre['langue'])) : 'N/A'; ?>')">
-                                                <i class="fas fa-info-circle"></i> Détails
-                                            </button>
-                                        </div>
-                                    </div>
-                                </div>
-                            <?php endforeach; ?>
-                        </div>
-
-                        <!-- Pagination simplifiée -->
-                        <?php if ($totalResults > $perPage): ?>
-                            <div class="mt-6 flex justify-center">
-                                <nav class="relative z-0 inline-flex rounded-md shadow-sm -space-x-px" aria-label="Pagination">
-                                    <?php
-                                    $totalPages = ceil($totalResults / $perPage);
-                                    $queryParams = $_GET;
-                                    
-                                    // Bouton précédent
-                                    $queryParams['page'] = max(1, $page - 1);
-                                    $prevLink = '?' . http_build_query($queryParams);
-                                    ?>
-                                    <a href="<?php echo $page > 1 ? $prevLink : '#'; ?>" class="<?php echo $page > 1 ? '' : 'opacity-50 cursor-not-allowed'; ?> relative inline-flex items-center px-2 py-2 rounded-l-md border border-gray-300 bg-white text-sm font-medium text-gray-500 hover:bg-gray-50">
-                                        <span class="sr-only">Précédent</span>
-                                        <i class="fas fa-chevron-left"></i>
-                                    </a>
-                                    
-                                    <?php
-                                    // Affichage des pages (limité à 5 pages)
-                                    $startPage = max(1, min($page - 2, $totalPages - 4));
-                                    $endPage = min($totalPages, $startPage + 4);
-                                    
-                                    for ($i = $startPage; $i <= $endPage; $i++) {
-                                        $queryParams['page'] = $i;
-                                        $pageLink = '?' . http_build_query($queryParams);
-                                        $isActive = $i === $page;
-                                    ?>
-                                        <a href="<?php echo $pageLink; ?>" class="relative inline-flex items-center px-4 py-2 border border-gray-300 <?php echo $isActive ? 'bg-indigo-50 text-indigo-600' : 'bg-white text-gray-500 hover:bg-gray-50'; ?> text-sm font-medium">
-                                            <?php echo $i; ?>
-                                        </a>
-                                    <?php } ?>
-                                    
-                                    <?php
-                                    // Bouton suivant
-                                    $queryParams['page'] = min($totalPages, $page + 1);
-                                    $nextLink = '?' . http_build_query($queryParams);
-                                    ?>
-                                    <a href="<?php echo $page < $totalPages ? $nextLink : '#'; ?>" class="<?php echo $page < $totalPages ? '' : 'opacity-50 cursor-not-allowed'; ?> relative inline-flex items-center px-2 py-2 rounded-r-md border border-gray-300 bg-white text-sm font-medium text-gray-500 hover:bg-gray-50">
-                                        <span class="sr-only">Suivant</span>
-                                        <i class="fas fa-chevron-right"></i>
-                                    </a>
-                                </nav>
-                            </div>
-                        <?php endif; ?>
-                    <?php else: ?>
-                        <div class="bg-yellow-50 border-l-4 border-yellow-400 p-4 rounded-md">
-                            <div class="flex">
-                                <div class="flex-shrink-0">
-                                    <i class="fas fa-exclamation-triangle text-yellow-400"></i>
-                                </div>
-                                <div class="ml-3">
-                                    <p class="text-sm text-yellow-700">
-                                        Aucun livre ne correspond à votre recherche. Essayez de modifier vos critères.
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    <?php endif; ?>
                 </div>
-            <?php endif; ?>
 
-            <!-- Section Statistiques simplifiée -->
-            <div id="statistiques" class="bg-white rounded-lg shadow-md p-6 mb-8">
-                <h2 class="text-xl font-semibold mb-6 text-gray-800">Statistiques de la bibliothèque</h2>
-                
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-                    <div class="bg-blue-50 rounded-lg p-4 shadow">
-                        <div class="flex items-center">
-                            <div class="p-3 rounded-full bg-blue-500 text-white mr-4">
-                                <i class="fas fa-book"></i>
-                            </div>
-                            <div>
-                                <p class="text-sm text-blue-600">Total des notices</p>
-                                <p class="text-2xl font-bold text-blue-800"><?php echo number_format($stats['total']); ?></p>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="bg-purple-50 rounded-lg p-4 shadow">
-                        <div class="flex items-center">
-                            <div class="p-3 rounded-full bg-purple-500 text-white mr-4">
-                                <i class="fas fa-copy"></i>
-                            </div>
-                            <div>
-                                <p class="text-sm text-purple-600">Total des exemplaires</p>
-                                <p class="text-2xl font-bold text-purple-800"><?php echo number_format($stats['exemplaires']); ?></p>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="bg-green-50 rounded-lg p-4 shadow">
-                        <div class="flex items-center">
-                            <div class="p-3 rounded-full bg-green-500 text-white mr-4">
-                                <i class="fas fa-users"></i>
-                            </div>
-                            <div>
-                                <p class="text-sm text-green-600">Total des auteurs</p>
-                                <p class="text-2xl font-bold text-green-800"><?php echo number_format($stats['auteurs']); ?></p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- Bouton pour charger les graphiques à la demande -->
-                <div class="text-center">
-                    <button id="loadChartsBtn" class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2">
-                        <i class="fas fa-chart-bar mr-2"></i>Charger les graphiques détaillés
+                <button id="resetBtn" type="button" class="reset-btn">
+                    <i data-lucide="rotate-ccw"></i>
+                    Reset filters
+                </button>
+            </aside>
+
+            <div id="sidebarOverlay" class="sidebar-overlay"></div>
+
+            <main class="main-content">
+                <section class="stats-strip">
+                    <article class="stat-chip primary">
+                        <span class="chip-label">Resultats courants</span>
+                        <span id="queryTotalChip" class="chip-value">0</span>
+                    </article>
+                    <article class="stat-chip">
+                        <span class="chip-label">Total livres (DB)</span>
+                        <span id="totalBooksChip" class="chip-value">--</span>
+                    </article>
+                    <article class="stat-chip">
+                        <span class="chip-label">Top matiere</span>
+                        <span id="topMatiereChip" class="chip-value">--</span>
+                    </article>
+                    <article class="stat-chip">
+                        <span class="chip-label">Range annee</span>
+                        <span id="yearRangeChip" class="chip-value">--</span>
+                    </article>
+                </section>
+
+                <div id="resultsMeta" class="results-meta"></div>
+
+                <section id="skeletonGrid" class="results-grid"></section>
+                <section id="resultsGrid" class="results-grid hidden" aria-live="polite"></section>
+
+                <section id="emptyState" class="empty-state hidden">
+                    <div class="empty-icon">📭</div>
+                    <h3>Aucun resultat</h3>
+                    <p>Essayez une autre combinaison de filtres.</p>
+                </section>
+
+                <div class="pagination">
+                    <button id="prevBtn" type="button" class="page-btn">
+                        <i data-lucide="chevron-left"></i>
+                        Prev
                     </button>
-                    <div id="chartsContainer" class="hidden mt-6">
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-                            <div>
-                                <h3 class="text-lg font-medium mb-4 text-gray-700">Top 10 des matières</h3>
-                                <div class="h-80">
-                                    <canvas id="matieresChart"></canvas>
-                                </div>
-                            </div>
-                            <div>
-                                <h3 class="text-lg font-medium mb-4 text-gray-700">Top 10 des années de publication</h3>
-                                <div class="h-80">
-                                    <canvas id="anneesChart"></canvas>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <?php if (!empty($stats['langues'])): ?>
-                        <!-- Ajout du graphique de répartition par langue -->
-                        <div class="mt-6">
-                            <h3 class="text-lg font-medium mb-4 text-gray-700">Répartition par langue</h3>
-                            <div class="h-80">
-                                <canvas id="languesChart"></canvas>
-                            </div>
-                        </div>
-                        <?php endif; ?>
-                    </div>
+                    <div id="pageInfo" class="page-info">Page 1 sur 1</div>
+                    <button id="nextBtn" type="button" class="page-btn">
+                        Next
+                        <i data-lucide="chevron-right"></i>
+                    </button>
                 </div>
-            </div>
-            
-            <!-- Affichage des informations de débogage (à supprimer en production) -->
-            <?php if (!empty($debugInfo) && isset($_GET['debug'])): ?>
-            <div class="bg-gray-100 p-4 rounded-lg mb-8">
-                <h3 class="text-lg font-medium mb-2">Informations de débogage</h3>
-                <pre class="text-xs overflow-auto"><?php echo implode("\n", $debugInfo); ?></pre>
-            </div>
-            <?php endif; ?>
-        <?php endif; ?>
-    </main>
 
-    <!-- Modal de détails (simplifié) -->
-    <div id="detailsModal" class="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center hidden">
-        <div class="bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4 overflow-hidden">
-            <div class="flex justify-between items-center border-b border-gray-200 px-6 py-4">
-                <h3 class="text-lg font-medium text-gray-900" id="modalTitle">Détails du livre</h3>
-                <button onclick="closeModal()" class="text-gray-400 hover:text-gray-500 focus:outline-none">
-                    <i class="fas fa-times"></i>
-                </button>
-            </div>
-            <div class="px-6 py-4">
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div>
-                        <p class="text-sm font-medium text-gray-500">Titre</p>
-                        <p class="text-base text-gray-900 mb-3" id="modalTitre"></p>
-                        
-                        <p class="text-sm font-medium text-gray-500">Auteur</p>
-                        <p class="text-base text-gray-900 mb-3" id="modalAuteur"></p>
-                        
-                        <p class="text-sm font-medium text-gray-500">Cote</p>
-                        <p class="text-base text-gray-900 mb-3" id="modalCote"></p>
-                        
-                        <p class="text-sm font-medium text-gray-500">Matière</p>
-                        <p class="text-base text-gray-900 mb-3" id="modalMatiere"></p>
-                        
-                        <p class="text-sm font-medium text-gray-500">Langue</p>
-                        <p class="text-base text-gray-900 mb-3" id="modalLangue"></p>
+                <section class="detailed-stats">
+                    <div class="detailed-head">
+                        <h3 class="detailed-title">Statistiques détaillées</h3>
+                        <button id="loadChartsBtn" type="button" class="load-charts-btn">
+                            Charger les graphiques détaillés
+                        </button>
                     </div>
-                    <div>
-                        <p class="text-sm font-medium text-gray-500">Lieu d'édition</p>
-                        <p class="text-base text-gray-900 mb-3" id="modalLieu"></p>
-                        
-                        <p class="text-sm font-medium text-gray-500">Éditeur</p>
-                        <p class="text-base text-gray-900 mb-3" id="modalEdition"></p>
-                        
-                        <p class="text-sm font-medium text-gray-500">Année</p>
-                        <p class="text-base text-gray-900 mb-3" id="modalAnnee"></p>
-                        
-                        <p class="text-sm font-medium text-gray-500">Nombre de pages</p>
-                        <p class="text-base text-gray-900" id="modalPages"></p>
+
+                    <div class="detailed-counters">
+                        <article class="detailed-counter">
+                            <span class="label">Résultats courants</span>
+                            <span id="detailedQueryTotal" class="value">0</span>
+                        </article>
+                        <article class="detailed-counter">
+                            <span class="label">Total livres (DB)</span>
+                            <span id="detailedTotalBooks" class="value">--</span>
+                        </article>
+                        <article class="detailed-counter">
+                            <span class="label">Top matière</span>
+                            <span id="detailedTopMatiere" class="value">--</span>
+                        </article>
+                        <article class="detailed-counter">
+                            <span class="label">Plage années</span>
+                            <span id="detailedYearRange" class="value">--</span>
+                        </article>
+                    </div>
+
+                    <div id="chartsWrap" class="charts-grid hidden">
+                        <article class="chart-card">
+                            <h4 class="chart-title">Graphe des matières (barres)</h4>
+                            <div class="line-chart-wrap">
+                                <canvas id="matieresChart"></canvas>
+                            </div>
+                        </article>
+                        <article class="chart-card">
+                            <h4 class="chart-title">Graphe des années (courbe)</h4>
+                            <div class="line-chart-wrap">
+                                <canvas id="anneesChart"></canvas>
+                            </div>
+                        </article>
+                    </div>
+                </section>
+            </main>
+
+            <div id="detailsModal" class="modal-overlay hidden" aria-hidden="true" role="dialog" aria-modal="true">
+                <div class="modal-card">
+                    <div class="modal-head">
+                        <h3 class="modal-title">Détails du livre</h3>
+                        <button id="closeModalBtn" class="modal-close" type="button" aria-label="Fermer">
+                            <i data-lucide="x"></i>
+                        </button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="modal-grid">
+                            <div class="modal-item"><span class="modal-label">Titre</span><div id="modalTitre" class="modal-value">-</div></div>
+                            <div class="modal-item"><span class="modal-label">Auteur</span><div id="modalAuteur" class="modal-value">-</div></div>
+                            <div class="modal-item"><span class="modal-label">Cote</span><div id="modalCote" class="modal-value">-</div></div>
+                            <div class="modal-item"><span class="modal-label">Inventaire</span><div id="modalInventaire" class="modal-value">-</div></div>
+                            <div class="modal-item"><span class="modal-label">Matiere</span><div id="modalMatiere" class="modal-value">-</div></div>
+                            <div class="modal-item"><span class="modal-label">Langue</span><div id="modalLangue" class="modal-value">-</div></div>
+                            <div class="modal-item"><span class="modal-label">Annee</span><div id="modalAnnee" class="modal-value">-</div></div>
+                            <div class="modal-item"><span class="modal-label">Nombre de pages</span><div id="modalPages" class="modal-value">-</div></div>
+                            <div class="modal-item"><span class="modal-label">Edition</span><div id="modalEdition" class="modal-value">-</div></div>
+                            <div class="modal-item"><span class="modal-label">Lieu</span><div id="modalLieu" class="modal-value">-</div></div>
+                        </div>
                     </div>
                 </div>
-            </div>
-            <div class="bg-gray-50 px-6 py-4 flex justify-end">
-                <button onclick="closeModal()" class="px-4 py-2 bg-gray-200 text-gray-800 rounded hover:bg-gray-300 focus:outline-none">
-                    Fermer
-                </button>
             </div>
         </div>
     </div>
 
-    <footer class="bg-gray-800 text-white py-4">
-        <div class="container mx-auto px-4 text-center">
-            <p>&copy; <?php echo date('Y'); ?> Bibliothèque Universitaire</p>
-        </div>
-    </footer>
-
     <script>
-        // Fonctions pour le modal
-        function showDetails(titre, auteur, cote, lieu, edition, annee, pages, matiere, inventaire, langue) {
-            document.getElementById('modalTitre').textContent = titre || 'Non spécifié';
-            document.getElementById('modalAuteur').textContent = auteur || 'Non spécifié';
-            document.getElementById('modalCote').textContent = cote || 'Non spécifié';
-            document.getElementById('modalLieu').textContent = lieu || 'Non spécifié';
-            document.getElementById('modalEdition').textContent = edition || 'Non spécifié';
-            document.getElementById('modalAnnee').textContent = annee || 'Non spécifié';
-            document.getElementById('modalPages').textContent = pages ? pages + ' pages' : 'Non spécifié';
-            document.getElementById('modalMatiere').textContent = matiere || 'Non spécifié';
-            document.getElementById('modalLangue').textContent = langue || 'Non spécifié';
-            
-            document.getElementById('detailsModal').classList.remove('hidden');
-            document.body.style.overflow = 'hidden';
+        const DEFAULT_STATE = {
+            q: "",
+            langue: "",
+            matiere: "",
+            annee_min: "",
+            annee_max: "",
+            sort: "titre",
+            order: "ASC",
+            page: 1,
+            per_page: 12,
+            total_pages: 1
+        };
+
+        const state = { ...DEFAULT_STATE };
+        let statsCache = null;
+        let activeController = null;
+        let currentResults = [];
+        const chartInstances = { matieres: null, annees: null };
+
+        const refs = {
+            layout: document.getElementById("mainLayout"),
+            sidebar: document.getElementById("sidebar"),
+            sidebarOverlay: document.getElementById("sidebarOverlay"),
+            openSidebarBtn: document.getElementById("openSidebarBtn"),
+            closeSidebarBtn: document.getElementById("closeSidebarBtn"),
+            searchInput: document.getElementById("searchInput"),
+            languageButtons: document.getElementById("languageButtons"),
+            matiereSelect: document.getElementById("matiereSelect"),
+            yearMin: document.getElementById("yearMin"),
+            yearMax: document.getElementById("yearMax"),
+            yearHint: document.getElementById("yearHint"),
+            sortField: document.getElementById("sortField"),
+            orderToggle: document.getElementById("orderToggle"),
+            orderArrow: document.getElementById("orderArrow"),
+            orderLabel: document.getElementById("orderLabel"),
+            resetBtn: document.getElementById("resetBtn"),
+            themeToggleBtn: document.getElementById("themeToggleBtn"),
+            exportBtn: document.getElementById("exportBtn"),
+            dbTotalCount: document.getElementById("dbTotalCount"),
+            queryTotalChip: document.getElementById("queryTotalChip"),
+            totalBooksChip: document.getElementById("totalBooksChip"),
+            topMatiereChip: document.getElementById("topMatiereChip"),
+            yearRangeChip: document.getElementById("yearRangeChip"),
+            resultsMeta: document.getElementById("resultsMeta"),
+            skeletonGrid: document.getElementById("skeletonGrid"),
+            resultsGrid: document.getElementById("resultsGrid"),
+            emptyState: document.getElementById("emptyState"),
+            prevBtn: document.getElementById("prevBtn"),
+            nextBtn: document.getElementById("nextBtn"),
+            pageInfo: document.getElementById("pageInfo"),
+            loadChartsBtn: document.getElementById("loadChartsBtn"),
+            chartsWrap: document.getElementById("chartsWrap"),
+            matieresChart: document.getElementById("matieresChart"),
+            anneesChart: document.getElementById("anneesChart"),
+            detailedQueryTotal: document.getElementById("detailedQueryTotal"),
+            detailedTotalBooks: document.getElementById("detailedTotalBooks"),
+            detailedTopMatiere: document.getElementById("detailedTopMatiere"),
+            detailedYearRange: document.getElementById("detailedYearRange"),
+            detailsModal: document.getElementById("detailsModal"),
+            closeModalBtn: document.getElementById("closeModalBtn"),
+            modalTitre: document.getElementById("modalTitre"),
+            modalAuteur: document.getElementById("modalAuteur"),
+            modalCote: document.getElementById("modalCote"),
+            modalInventaire: document.getElementById("modalInventaire"),
+            modalMatiere: document.getElementById("modalMatiere"),
+            modalLangue: document.getElementById("modalLangue"),
+            modalAnnee: document.getElementById("modalAnnee"),
+            modalPages: document.getElementById("modalPages"),
+            modalEdition: document.getElementById("modalEdition"),
+            modalLieu: document.getElementById("modalLieu")
+        };
+
+        function debounce(callback, delay) {
+            let timer = null;
+            return (...args) => {
+                clearTimeout(timer);
+                timer = setTimeout(() => callback(...args), delay);
+            };
         }
-        
-        function closeModal() {
-            document.getElementById('detailsModal').classList.add('hidden');
-            document.body.style.overflow = 'auto';
+
+        const debouncedRunSearch = debounce(() => {
+            state.page = 1;
+            fetchResults();
+        }, 300);
+
+        function isArabic(text) {
+            return /[\u0600-\u06FF]/.test(String(text || ""));
         }
-        
-        // Fermer le modal en cliquant en dehors
-        document.getElementById('detailsModal').addEventListener('click', function(e) {
-            if (e.target === this) {
-                closeModal();
+
+        function escapeHtml(value) {
+            return String(value ?? "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/\"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        function toDisplayNumber(value) {
+            const number = Number(value || 0);
+            return number.toLocaleString("fr-FR");
+        }
+
+        function getLanguageLabel(langue) {
+            const key = String(langue || "").toLowerCase();
+            if (key.startsWith("fr")) return "French";
+            if (key.startsWith("en")) return "English";
+            if (key.startsWith("ar")) return "Arabic";
+            return "Unknown";
+        }
+
+        function pickFirst(...values) {
+            for (const value of values) {
+                if (value !== null && value !== undefined && String(value).trim() !== "") {
+                    return value;
+                }
             }
-        });
-        
-        // Mode sombre
-        const darkModeToggle = document.getElementById('darkModeToggle');
-        if (darkModeToggle) {
-            // Vérifier si le mode sombre est activé
-            const isDarkMode = localStorage.getItem('darkMode') === 'true';
-            if (isDarkMode) {
-                document.documentElement.classList.add('dark');
-                darkModeToggle.querySelector('i').classList.remove('fa-moon');
-                darkModeToggle.querySelector('i').classList.add('fa-sun');
+            return "";
+        }
+
+        function applyDirectionalText(element, value) {
+            const text = String(value || "-");
+            element.textContent = text;
+            if (isArabic(text)) {
+                element.classList.add("rtl-text");
+                element.setAttribute("dir", "rtl");
+            } else {
+                element.classList.remove("rtl-text");
+                element.setAttribute("dir", "ltr");
             }
-            
-            // Toggle mode sombre
-            darkModeToggle.addEventListener('click', function() {
-                const isDark = document.documentElement.classList.toggle('dark');
-                localStorage.setItem('darkMode', isDark);
-                
-                // Changer l'icône
-                const icon = this.querySelector('i');
-                if (isDark) {
-                    icon.classList.remove('fa-moon');
-                    icon.classList.add('fa-sun');
-                } else {
-                    icon.classList.remove('fa-sun');
-                    icon.classList.add('fa-moon');
+        }
+
+        function buildQuery(includePage = true) {
+            const params = new URLSearchParams();
+            if (state.q) params.set("q", state.q);
+            if (state.matiere) params.set("matiere", state.matiere);
+            if (state.langue) params.set("langue", state.langue);
+            if (state.annee_min !== "") params.set("annee_min", state.annee_min);
+            if (state.annee_max !== "") params.set("annee_max", state.annee_max);
+            params.set("sort", state.sort);
+            params.set("order", state.order);
+
+            if (includePage) {
+                params.set("page", String(state.page));
+                params.set("per_page", String(state.per_page));
+            }
+
+            return params;
+        }
+
+        function setLoading(isLoading) {
+            if (isLoading) {
+                renderSkeleton(8);
+                refs.skeletonGrid.classList.remove("hidden");
+                refs.resultsGrid.classList.add("hidden");
+                refs.emptyState.classList.add("hidden");
+            } else {
+                refs.skeletonGrid.classList.add("hidden");
+                refs.resultsGrid.classList.remove("hidden");
+            }
+        }
+
+        function renderSkeleton(count) {
+            let html = "";
+            for (let i = 0; i < count; i += 1) {
+                html += `
+                    <article class="skeleton-card">
+                        <div class="skeleton-line short"></div>
+                        <div class="skeleton-line long"></div>
+                        <div class="skeleton-line medium"></div>
+                        <div class="skeleton-line long"></div>
+                    </article>
+                `;
+            }
+            refs.skeletonGrid.innerHTML = html;
+        }
+
+        function renderEmpty(title = "Aucun resultat", message = "Essayez une autre combinaison de filtres.") {
+            refs.resultsGrid.innerHTML = "";
+            refs.emptyState.querySelector("h3").textContent = title;
+            refs.emptyState.querySelector("p").textContent = message;
+            refs.emptyState.classList.remove("hidden");
+        }
+
+        function renderCards(results) {
+            if (!Array.isArray(results) || results.length === 0) {
+                currentResults = [];
+                renderEmpty();
+                return;
+            }
+
+            refs.emptyState.classList.add("hidden");
+
+            currentResults = results.map((book) => {
+                return {
+                    id: pickFirst(book.id, book.notice_id),
+                    titre: pickFirst(book.titre, book.tit1, "Sans titre"),
+                    auteur: pickFirst(book.auteur, book.author_name, "Auteur inconnu"),
+                    cote: pickFirst(book.cote, book.expl_cote, "N/A"),
+                    inventaire: pickFirst(book.inventaire, book.expl_cb, "N/A"),
+                    matiere: pickFirst(book.matiere, book.libelle_categorie, "Non specifie"),
+                    annee: pickFirst(book.annee, book.year, "N/A"),
+                    langue: pickFirst(book.langue, book.code_langue, "N/A"),
+                    lieu: pickFirst(book.lieu, book.ed_ville, "N/A"),
+                    edition: pickFirst(book.edition, book.ed_name, "N/A"),
+                    nb_pages: pickFirst(book.nb_pages, book.npages, book.pages, "N/A")
+                };
+            });
+
+            const html = currentResults.map((book, index) => {
+                const titre = book.titre;
+                const auteur = book.auteur;
+                const cote = book.cote;
+                const inventaire = book.inventaire;
+                const matiere = book.matiere;
+                const annee = book.annee;
+                const langue = book.langue;
+                const lieu = book.lieu;
+                const nbPages = book.nb_pages;
+                const titleRtl = isArabic(titre) ? "rtl-text" : "";
+                const authorRtl = isArabic(auteur) ? "rtl-text" : "";
+                const matiereRtl = isArabic(matiere) ? "rtl-text" : "";
+                const langLabel = getLanguageLabel(langue);
+                const inventaireShort = String(inventaire).length > 14 ? `${String(inventaire).slice(0, 14)}...` : inventaire;
+
+                return `
+                    <article class="book-card">
+                        <div class="book-top">
+                            <h3 class="book-title ${titleRtl}" dir="${titleRtl ? "rtl" : "ltr"}">${escapeHtml(titre)}</h3>
+                            <span class="inventory-badge" title="${escapeHtml(inventaire)}">${escapeHtml(inventaireShort)}</span>
+                        </div>
+                        <p class="book-author ${authorRtl}" dir="${authorRtl ? "rtl" : "ltr"}">
+                            <i data-lucide="user"></i>
+                            <span>${escapeHtml(auteur)}</span>
+                        </p>
+                        <div class="book-info-grid">
+                            <span class="book-inline-item">
+                                <i data-lucide="map-pin"></i>
+                                <span>${escapeHtml(lieu)}</span>
+                            </span>
+                            <span class="book-inline-item">
+                                <i data-lucide="calendar-days"></i>
+                                <span>${escapeHtml(annee)}</span>
+                            </span>
+                            <span class="book-inline-item ${matiereRtl}" dir="${matiereRtl ? "rtl" : "ltr"}">
+                                <i data-lucide="bookmark"></i>
+                                <span>${escapeHtml(matiere)}</span>
+                            </span>
+                            <span class="book-inline-item">
+                                <i data-lucide="file-text"></i>
+                                <span>${escapeHtml(nbPages)} p.</span>
+                            </span>
+                        </div>
+                        <div class="book-bottom">
+                            <div class="book-footer-left">
+                                <span class="cote-badge"><i data-lucide="barcode"></i> ${escapeHtml(cote)}</span>
+                                <span class="lang-badge">${escapeHtml(langLabel)}</span>
+                            </div>
+                            <div class="book-actions">
+                                <button type="button" class="details-btn" data-index="${index}"><i data-lucide="info"></i>Détails</button>
+                            </div>
+                        </div>
+                    </article>
+                `;
+            }).join("");
+
+            refs.resultsGrid.innerHTML = html;
+            lucide.createIcons();
+        }
+
+        function openDetailsModal(index) {
+            const book = currentResults[index];
+            if (!book) return;
+
+            applyDirectionalText(refs.modalTitre, book.titre || "-");
+            applyDirectionalText(refs.modalAuteur, book.auteur || "-");
+            applyDirectionalText(refs.modalCote, book.cote || "-");
+            applyDirectionalText(refs.modalInventaire, book.inventaire || "-");
+            applyDirectionalText(refs.modalMatiere, book.matiere || "-");
+
+            const langue = getLanguageLabel(book.langue);
+            applyDirectionalText(refs.modalLangue, langue);
+            applyDirectionalText(refs.modalAnnee, book.annee || "-");
+            applyDirectionalText(refs.modalPages, book.nb_pages || "-");
+            applyDirectionalText(refs.modalEdition, book.edition || "-");
+            applyDirectionalText(refs.modalLieu, book.lieu || "-");
+
+            refs.detailsModal.classList.remove("hidden");
+            refs.detailsModal.setAttribute("aria-hidden", "false");
+            document.body.style.overflow = "hidden";
+        }
+
+        function closeDetailsModal() {
+            refs.detailsModal.classList.add("hidden");
+            refs.detailsModal.setAttribute("aria-hidden", "true");
+            document.body.style.overflow = "";
+        }
+
+        function updatePagination(total, page, totalPages) {
+            const safeTotal = Number(total || 0);
+            state.page = Math.max(Number(page || 1), 1);
+            state.total_pages = Math.max(Number(totalPages || 1), 1);
+
+            refs.queryTotalChip.textContent = toDisplayNumber(safeTotal);
+            refs.detailedQueryTotal.textContent = toDisplayNumber(safeTotal);
+            refs.pageInfo.textContent = `Page ${state.page} sur ${state.total_pages}`;
+            refs.prevBtn.disabled = state.page <= 1;
+            refs.nextBtn.disabled = state.page >= state.total_pages;
+
+            const activeFilters = [];
+            if (state.q) activeFilters.push(`q: "${state.q}"`);
+            if (state.matiere) activeFilters.push(`matiere: ${state.matiere}`);
+            if (state.langue) activeFilters.push(`langue: ${getLanguageLabel(state.langue)}`);
+            if (state.annee_min) activeFilters.push(`annee >= ${state.annee_min}`);
+            if (state.annee_max) activeFilters.push(`annee <= ${state.annee_max}`);
+
+            refs.resultsMeta.textContent = activeFilters.length > 0
+                ? `${toDisplayNumber(safeTotal)} resultat(s) | ${activeFilters.join(" | ")}`
+                : `${toDisplayNumber(safeTotal)} resultat(s) | Tous les livres`;
+        }
+
+        function updateDetailedStaticCounters(totalBooks, topMatiere, yearRange) {
+            refs.detailedTotalBooks.textContent = totalBooks;
+            refs.detailedTopMatiere.textContent = topMatiere;
+            refs.detailedYearRange.textContent = yearRange;
+        }
+
+        function chartTheme() {
+            const isLight = document.body.classList.contains("theme-light");
+            return {
+                textColor: isLight ? "#42567f" : "#c9d7f5",
+                gridColor: isLight ? "rgba(57,88,142,0.15)" : "rgba(146,165,202,0.22)",
+                barColor: [
+                    "rgba(79,124,255,0.78)",
+                    "rgba(127,91,255,0.72)",
+                    "rgba(54,162,235,0.72)",
+                    "rgba(255,159,64,0.72)",
+                    "rgba(75,192,192,0.72)",
+                    "rgba(255,99,132,0.72)"
+                ],
+                lineColor: isLight ? "rgba(64,104,199,0.95)" : "rgba(95,143,255,0.95)",
+                lineFill: isLight ? "rgba(79,124,255,0.18)" : "rgba(79,124,255,0.24)"
+            };
+        }
+
+        function destroyCharts() {
+            if (chartInstances.matieres) {
+                chartInstances.matieres.destroy();
+                chartInstances.matieres = null;
+            }
+            if (chartInstances.annees) {
+                chartInstances.annees.destroy();
+                chartInstances.annees = null;
+            }
+        }
+
+        function renderMatieresBarChart(matieres) {
+            if (!refs.matieresChart) return;
+
+            const source = (Array.isArray(matieres) ? matieres : []).slice(0, 10);
+            if (source.length === 0) {
+                if (chartInstances.matieres) {
+                    chartInstances.matieres.destroy();
+                    chartInstances.matieres = null;
+                }
+                return;
+            }
+
+            const ctx = refs.matieresChart.getContext("2d");
+            if (chartInstances.matieres) {
+                chartInstances.matieres.destroy();
+            }
+
+            const theme = chartTheme();
+
+            chartInstances.matieres = new Chart(ctx, {
+                type: "bar",
+                data: {
+                    labels: source.map((item) => item?.matiere || "Non spécifié"),
+                    datasets: [{
+                        label: "Nombre de livres",
+                        data: source.map((item) => Number(item?.count || 0)),
+                        backgroundColor: source.map((_, idx) => theme.barColor[idx % theme.barColor.length]),
+                        borderWidth: 0,
+                        borderRadius: 6
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: theme.textColor } }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            grid: { color: theme.gridColor },
+                            ticks: { color: theme.textColor }
+                        },
+                        x: {
+                            grid: { color: theme.gridColor },
+                            ticks: { color: theme.textColor, maxRotation: 45, minRotation: 20 }
+                        }
+                    }
                 }
             });
         }
-        
-        // Chargement des graphiques à la demande
-        const loadChartsBtn = document.getElementById('loadChartsBtn');
-        const chartsContainer = document.getElementById('chartsContainer');
-        
-        if (loadChartsBtn && chartsContainer) {
-            loadChartsBtn.addEventListener('click', function() {
-                // Afficher le conteneur de graphiques
-                chartsContainer.classList.remove('hidden');
-                loadChartsBtn.classList.add('hidden');
-                
-                // Charger les données des graphiques via AJAX
-                fetch('stats.php')
-                    .then(response => response.json())
-                    .then(data => {
-                        // Créer les graphiques une fois les données chargées
-                        createCharts(data);
-                    })
-                    .catch(error => {
-                        console.error('Erreur lors du chargement des statistiques:', error);
-                        chartsContainer.innerHTML = '<div class="text-red-500 text-center">Erreur lors du chargement des graphiques</div>';
-                    });
+
+        function renderAnneesLineChart(annees) {
+            if (!refs.anneesChart) return;
+
+            const source = (Array.isArray(annees) ? annees : [])
+                .map((item) => ({ annee: Number(item?.annee), count: Number(item?.count || 0) }))
+                .filter((item) => Number.isFinite(item.annee) && item.annee > 0)
+                .sort((a, b) => a.annee - b.annee)
+                .slice(-12);
+
+            if (source.length === 0) {
+                if (chartInstances.annees) {
+                    chartInstances.annees.destroy();
+                    chartInstances.annees = null;
+                }
+                return;
+            }
+
+            const ctx = refs.anneesChart.getContext("2d");
+            if (chartInstances.annees) {
+                chartInstances.annees.destroy();
+            }
+
+            const theme = chartTheme();
+
+            chartInstances.annees = new Chart(ctx, {
+                type: "line",
+                data: {
+                    labels: source.map((item) => item.annee),
+                    datasets: [{
+                        label: "Nombre de livres",
+                        data: source.map((item) => item.count),
+                        borderColor: theme.lineColor,
+                        backgroundColor: theme.lineFill,
+                        fill: true,
+                        tension: 0.25,
+                        borderWidth: 2,
+                        pointRadius: 3,
+                        pointHoverRadius: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: theme.textColor } }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            grid: { color: theme.gridColor },
+                            ticks: { color: theme.textColor }
+                        },
+                        x: {
+                            grid: { color: theme.gridColor },
+                            ticks: { color: theme.textColor }
+                        }
+                    }
+                }
             });
         }
-        
-        function createCharts(data) {
-            // Configuration des couleurs pour le mode sombre/clair
-            const isDarkMode = document.documentElement.classList.contains('dark');
-            const textColor = isDarkMode ? '#e2e8f0' : '#4a5568';
-            const gridColor = isDarkMode ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)';
-            
-            // Graphique des matières
-            if (data.matieres && data.matieres.length > 0) {
-                const matieresCtx = document.getElementById('matieresChart').getContext('2d');
-                const matieresData = data.matieres.slice(0, 10); // Limiter à 10 matières
-                
-                new Chart(matieresCtx, {
-                    type: 'bar',
-                    data: {
-                        labels: matieresData.map(item => item.matiere),
-                        datasets: [{
-                            label: 'Nombre de livres',
-                            data: matieresData.map(item => item.count),
-                            backgroundColor: [
-                                'rgba(54, 162, 235, 0.7)',
-                                'rgba(255, 99, 132, 0.7)',
-                                'rgba(255, 206, 86, 0.7)',
-                                'rgba(75, 192, 192, 0.7)',
-                                'rgba(153, 102, 255, 0.7)',
-                                'rgba(255, 159, 64, 0.7)',
-                                'rgba(199, 199, 199, 0.7)',
-                                'rgba(83, 102, 255, 0.7)',
-                                'rgba(40, 159, 64, 0.7)',
-                                'rgba(210, 199, 199, 0.7)'
-                            ],
-                            borderWidth: 1
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        scales: {
-                            y: {
-                                beginAtZero: true,
-                                grid: {
-                                    color: gridColor
-                                },
-                                ticks: {
-                                    color: textColor
-                                }
-                            },
-                            x: {
-                                grid: {
-                                    color: gridColor
-                                },
-                                ticks: {
-                                    color: textColor,
-                                    maxRotation: 45,
-                                    minRotation: 45
-                                }
-                            }
-                        },
-                        plugins: {
-                            legend: {
-                                labels: {
-                                    color: textColor
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            
-            // Graphique des années
-            if (data.annees && data.annees.length > 0) {
-                const anneesCtx = document.getElementById('anneesChart').getContext('2d');
-                // Trier par année et prendre les 10 plus récentes
-                const anneesData = data.annees
-                    .sort((a, b) => b.annee - a.annee)
-                    .slice(0, 10);
-                
-                new Chart(anneesCtx, {
-                    type: 'line',
-                    data: {
-                        labels: anneesData.map(item => item.annee),
-                        datasets: [{
-                            label: 'Nombre de livres',
-                            data: anneesData.map(item => item.count),
-                            backgroundColor: 'rgba(75, 192, 192, 0.2)',
-                            borderColor: 'rgba(75, 192, 192, 1)',
-                            borderWidth: 2,
-                            tension: 0.1
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        scales: {
-                            y: {
-                                beginAtZero: true,
-                                grid: {
-                                    color: gridColor
-                                },
-                                ticks: {
-                                    color: textColor
-                                }
-                            },
-                            x: {
-                                grid: {
-                                    color: gridColor
-                                },
-                                ticks: {
-                                    color: textColor
-                                }
-                            }
-                        },
-                        plugins: {
-                            legend: {
-                                labels: {
-                                    color: textColor
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            
-            // Graphique des langues
-            if (data.langues && data.langues.length > 0 && document.getElementById('languesChart')) {
-                const languesCtx = document.getElementById('languesChart').getContext('2d');
-                const languesData = data.langues.slice(0, 10); // Limiter aux 10 langues les plus utilisées
-                
-                new Chart(languesCtx, {
-                    type: 'pie',
-                    data: {
-                        labels: languesData.map(item => item.code || 'Non spécifié'),
-                        datasets: [{
-                            data: languesData.map(item => item.count),
-                            backgroundColor: [
-                                'rgba(54, 162, 235, 0.7)',
-                                'rgba(255, 99, 132, 0.7)',
-                                'rgba(255, 206, 86, 0.7)',
-                                'rgba(75, 192, 192, 0.7)',
-                                'rgba(153, 102, 255, 0.7)',
-                                'rgba(255, 159, 64, 0.7)',
-                                'rgba(199, 199, 199, 0.7)',
-                                'rgba(83, 102, 255, 0.7)',
-                                'rgba(40, 159, 64, 0.7)',
-                                'rgba(210, 199, 199, 0.7)'
-                            ],
-                            borderWidth: 1
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        plugins: {
-                            legend: {
-                                position: 'right',
-                                labels: {
-                                    color: textColor
-                                }
-                            },
-                            tooltip: {
-                                callbacks: {
-                                    label: function(context) {
-                                        const label = context.label || '';
-                                        const value = context.raw;
-                                        const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                                        const percentage = Math.round((value / total) * 100);
-                                        return `${label}: ${value} (${percentage}%)`;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
+
+        function renderDetailedCharts() {
+            renderMatieresBarChart(statsCache?.matieres || []);
+            renderAnneesLineChart(statsCache?.annees || []);
+        }
+
+        function toggleDetailedCharts() {
+            const isHidden = refs.chartsWrap.classList.contains("hidden");
+
+            if (isHidden) {
+                renderDetailedCharts();
+                refs.chartsWrap.classList.remove("hidden");
+                refs.loadChartsBtn.textContent = 'Masquer les graphiques';
+            } else {
+                refs.chartsWrap.classList.add("hidden");
+                refs.loadChartsBtn.textContent = 'Charger les graphiques détaillés';
+                destroyCharts();
             }
         }
+
+        async function fetchResults() {
+            if (!refs.detailsModal.classList.contains("hidden")) {
+                closeDetailsModal();
+            }
+
+            if (activeController) {
+                activeController.abort();
+            }
+
+            const controller = new AbortController();
+            activeController = controller;
+            setLoading(true);
+
+            try {
+                const query = buildQuery(true).toString();
+                const response = await fetch(`search.php?${query}`, {
+                    signal: controller.signal,
+                    headers: { "Accept": "application/json" }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const payload = await response.json();
+                if (payload.error) {
+                    throw new Error(payload.error);
+                }
+
+                renderCards(payload.results || []);
+                updatePagination(payload.total || 0, payload.page || 1, payload.total_pages || 1);
+            } catch (error) {
+                if (error.name === "AbortError") {
+                    return;
+                }
+                renderEmpty("Erreur de chargement", error.message || "Impossible de recuperer les resultats.");
+                updatePagination(0, 1, 1);
+            } finally {
+                if (activeController === controller) {
+                    setLoading(false);
+                    activeController = null;
+                }
+            }
+        }
+
+        function populateMatiereOptions(matieres) {
+            const initial = '<option value="">Toutes les matieres</option>';
+            if (!Array.isArray(matieres) || matieres.length === 0) {
+                refs.matiereSelect.innerHTML = initial;
+                return;
+            }
+
+            const options = matieres.map((item) => {
+                const label = item && item.matiere ? item.matiere : "Non specifie";
+                const count = item && item.count ? ` (${item.count})` : "";
+                return `<option value="${escapeHtml(label)}">${escapeHtml(label + count)}</option>`;
+            }).join("");
+
+            refs.matiereSelect.innerHTML = initial + options;
+        }
+
+        function computeYearRange(stats) {
+            if (stats && stats.annee_range && Number(stats.annee_range.min) && Number(stats.annee_range.max)) {
+                return {
+                    min: Number(stats.annee_range.min),
+                    max: Number(stats.annee_range.max)
+                };
+            }
+
+            if (Array.isArray(stats?.annees) && stats.annees.length > 0) {
+                const years = stats.annees
+                    .map((row) => Number(row.annee))
+                    .filter((year) => Number.isFinite(year) && year > 0);
+
+                if (years.length > 0) {
+                    return {
+                        min: Math.min(...years),
+                        max: Math.max(...years)
+                    };
+                }
+            }
+
+            return null;
+        }
+
+        async function fetchStats() {
+            try {
+                const response = await fetch("stats.php", {
+                    headers: { "Accept": "application/json" }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const payload = await response.json();
+                if (payload.error) {
+                    throw new Error(payload.error);
+                }
+
+                statsCache = payload;
+
+                const total = Number(payload.total || 0);
+                refs.dbTotalCount.textContent = `${toDisplayNumber(total)} livres`;
+                refs.totalBooksChip.textContent = toDisplayNumber(total);
+
+                const topMatiere = Array.isArray(payload.matieres) && payload.matieres[0]
+                    ? payload.matieres[0].matiere
+                    : "--";
+                refs.topMatiereChip.textContent = topMatiere || "--";
+
+                let yearRangeLabel = "--";
+
+                const yearRange = computeYearRange(payload);
+                if (yearRange) {
+                    yearRangeLabel = `${yearRange.min} - ${yearRange.max}`;
+                    refs.yearRangeChip.textContent = yearRangeLabel;
+                    refs.yearHint.textContent = `Plage: ${yearRange.min} - ${yearRange.max}`;
+                    refs.yearMin.min = String(yearRange.min);
+                    refs.yearMin.max = String(yearRange.max);
+                    refs.yearMax.min = String(yearRange.min);
+                    refs.yearMax.max = String(yearRange.max);
+                    refs.yearMin.placeholder = String(yearRange.min);
+                    refs.yearMax.placeholder = String(yearRange.max);
+                } else {
+                    refs.yearRangeChip.textContent = "--";
+                    refs.yearHint.textContent = "Plage: --";
+                }
+
+                populateMatiereOptions(payload.matieres || []);
+                updateDetailedStaticCounters(
+                    refs.totalBooksChip.textContent,
+                    refs.topMatiereChip.textContent,
+                    yearRangeLabel
+                );
+
+                if (!refs.chartsWrap.classList.contains("hidden")) {
+                    renderDetailedCharts();
+                }
+            } catch (error) {
+                refs.dbTotalCount.textContent = "Stats indisponibles";
+                refs.totalBooksChip.textContent = "--";
+                refs.topMatiereChip.textContent = "--";
+                refs.yearRangeChip.textContent = "--";
+                refs.yearHint.textContent = "Plage: --";
+                updateDetailedStaticCounters("--", "--", "--");
+            }
+        }
+
+        function isMobileView() {
+            return window.innerWidth <= 980;
+        }
+
+        function closeSidebar() {
+            if (isMobileView()) {
+                refs.sidebar.classList.remove("open");
+                refs.sidebarOverlay.classList.remove("visible");
+                return;
+            }
+
+            refs.layout.classList.add("sidebar-collapsed");
+        }
+
+        function openSidebar() {
+            if (isMobileView()) {
+                refs.sidebar.classList.add("open");
+                refs.sidebarOverlay.classList.add("visible");
+                return;
+            }
+
+            refs.layout.classList.remove("sidebar-collapsed");
+        }
+
+        function syncSidebarOnResize() {
+            if (isMobileView()) {
+                refs.layout.classList.remove("sidebar-collapsed");
+            } else {
+                refs.sidebar.classList.remove("open");
+                refs.sidebarOverlay.classList.remove("visible");
+            }
+        }
+
+        function applyOrderUi() {
+            refs.orderLabel.textContent = state.order;
+            refs.orderArrow.textContent = state.order === "ASC" ? "↑" : "↓";
+        }
+
+        function updateThemeToggleIcon() {
+            const isLight = document.body.classList.contains("theme-light");
+            refs.themeToggleBtn.innerHTML = isLight
+                ? '<i data-lucide="moon"></i>'
+                : '<i data-lucide="sun"></i>';
+            lucide.createIcons();
+        }
+
+        function applySavedTheme() {
+            const savedTheme = localStorage.getItem("library-theme");
+            if (savedTheme === "dark") {
+                document.body.classList.remove("theme-light");
+            } else {
+                document.body.classList.add("theme-light");
+            }
+            updateThemeToggleIcon();
+        }
+
+        function toggleTheme() {
+            document.body.classList.toggle("theme-light");
+            const isLight = document.body.classList.contains("theme-light");
+            localStorage.setItem("library-theme", isLight ? "light" : "dark");
+            updateThemeToggleIcon();
+
+            if (!refs.chartsWrap.classList.contains("hidden")) {
+                renderDetailedCharts();
+            }
+        }
+
+        function setActiveLanguage(lang) {
+            const buttons = refs.languageButtons.querySelectorAll(".lang-btn");
+            buttons.forEach((btn) => {
+                btn.classList.toggle("active", btn.dataset.lang === lang);
+            });
+        }
+
+        function resetFilters() {
+            state.q = "";
+            state.langue = "";
+            state.matiere = "";
+            state.annee_min = "";
+            state.annee_max = "";
+            state.sort = "titre";
+            state.order = "ASC";
+            state.page = 1;
+
+            refs.searchInput.value = "";
+            refs.matiereSelect.value = "";
+            refs.yearMin.value = "";
+            refs.yearMax.value = "";
+            refs.sortField.value = "titre";
+            applyOrderUi();
+            setActiveLanguage("");
+
+            fetchResults();
+        }
+
+        function bindEvents() {
+            refs.openSidebarBtn.addEventListener("click", openSidebar);
+            refs.closeSidebarBtn.addEventListener("click", closeSidebar);
+            refs.sidebarOverlay.addEventListener("click", closeSidebar);
+            refs.themeToggleBtn.addEventListener("click", toggleTheme);
+            window.addEventListener("resize", syncSidebarOnResize);
+
+            refs.searchInput.addEventListener("input", (event) => {
+                state.q = event.target.value.trim();
+                debouncedRunSearch();
+            });
+
+            refs.languageButtons.addEventListener("click", (event) => {
+                const target = event.target.closest(".lang-btn");
+                if (!target) return;
+                state.langue = target.dataset.lang || "";
+                state.page = 1;
+                setActiveLanguage(state.langue);
+                fetchResults();
+                if (window.innerWidth <= 980) closeSidebar();
+            });
+
+            refs.matiereSelect.addEventListener("change", (event) => {
+                state.matiere = event.target.value;
+                state.page = 1;
+                fetchResults();
+            });
+
+            refs.yearMin.addEventListener("input", (event) => {
+                state.annee_min = event.target.value.trim();
+                debouncedRunSearch();
+            });
+
+            refs.yearMax.addEventListener("input", (event) => {
+                state.annee_max = event.target.value.trim();
+                debouncedRunSearch();
+            });
+
+            refs.sortField.addEventListener("change", (event) => {
+                state.sort = event.target.value;
+                state.page = 1;
+                fetchResults();
+            });
+
+            refs.orderToggle.addEventListener("click", () => {
+                state.order = state.order === "ASC" ? "DESC" : "ASC";
+                applyOrderUi();
+                state.page = 1;
+                fetchResults();
+            });
+
+            refs.loadChartsBtn.addEventListener("click", async () => {
+                if (!statsCache) {
+                    await fetchStats();
+                }
+                toggleDetailedCharts();
+            });
+
+            refs.resetBtn.addEventListener("click", resetFilters);
+
+            refs.prevBtn.addEventListener("click", () => {
+                if (state.page <= 1) return;
+                state.page -= 1;
+                fetchResults();
+            });
+
+            refs.nextBtn.addEventListener("click", () => {
+                if (state.page >= state.total_pages) return;
+                state.page += 1;
+                fetchResults();
+            });
+
+            refs.resultsGrid.addEventListener("click", (event) => {
+                const button = event.target.closest(".details-btn");
+                if (!button) return;
+                const index = Number(button.dataset.index);
+                if (Number.isNaN(index)) return;
+                openDetailsModal(index);
+            });
+
+            refs.closeModalBtn.addEventListener("click", closeDetailsModal);
+
+            refs.detailsModal.addEventListener("click", (event) => {
+                if (event.target === refs.detailsModal) {
+                    closeDetailsModal();
+                }
+            });
+
+            document.addEventListener("keydown", (event) => {
+                if (event.key === "Escape" && !refs.detailsModal.classList.contains("hidden")) {
+                    closeDetailsModal();
+                }
+            });
+
+            refs.exportBtn.addEventListener("click", () => {
+                const query = buildQuery(false).toString();
+                const target = query ? `export.php?${query}` : "export.php";
+                window.location.href = target;
+            });
+        }
+
+        async function init() {
+            lucide.createIcons();
+            applySavedTheme();
+            syncSidebarOnResize();
+            applyOrderUi();
+            bindEvents();
+            renderSkeleton(8);
+            await fetchStats();
+            await fetchResults();
+        }
+
+        init();
     </script>
 </body>
 </html>

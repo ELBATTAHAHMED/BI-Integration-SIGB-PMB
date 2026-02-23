@@ -3,7 +3,7 @@
 $host = 'localhost';
 $dbname = 'pmb';
 $user = 'root';
-$pass = 'root'; // Modifié selon votre script
+$pass = 'root123'; // Modifié selon votre script
 
 try {
     $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8", $user, $pass);
@@ -85,9 +85,16 @@ if ($colonneLangueExiste) {
     $stats['langues'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
 
-// Années min et max
-$stmt = $pdo->query("SELECT MIN(CAST(year AS SIGNED)) as min_annee, MAX(CAST(year AS SIGNED)) as max_annee FROM notices WHERE year IS NOT NULL AND year > 0");
+// Annees min et max (range de publication raisonnable)
+$stmt = $pdo->query("SELECT MIN(CAST(year AS SIGNED)) as min_annee, MAX(CAST(year AS SIGNED)) as max_annee FROM notices WHERE year IS NOT NULL AND year > 0 AND CAST(year AS SIGNED) BETWEEN 1800 AND YEAR(CURDATE()) + 1");
 $anneeRange = $stmt->fetch(PDO::FETCH_ASSOC);
+
+// Fallback brut si aucune annee dans la plage raisonnable
+if (empty($anneeRange['min_annee']) || empty($anneeRange['max_annee'])) {
+    $stmt = $pdo->query("SELECT MIN(CAST(year AS SIGNED)) as min_annee, MAX(CAST(year AS SIGNED)) as max_annee FROM notices WHERE year IS NOT NULL AND year > 0");
+    $anneeRange = $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
 $stats['annee_range'] = [
     'min' => (int)$anneeRange['min_annee'],
     'max' => (int)$anneeRange['max_annee']

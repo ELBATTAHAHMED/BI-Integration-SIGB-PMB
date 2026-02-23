@@ -1,0 +1,15 @@
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDE
+.idea/
+.vscode/
+*.iml
+
+# Local temporary files
+*.log
+*.tmp
+*.temp
+NUL
