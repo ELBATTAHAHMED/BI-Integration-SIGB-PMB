@@ -1,3 +1,5 @@
+![image_alt](https://github.com/ELBATTAHAHMED/BI-Integration-SIGB-PMB/blob/8a5f5dfd05d47b439e277a893e53c1e308c6b4f6/BI-Integration-SIGB-PMB.png)
+
 # BI-Integration-SIGB-PMB
 
 Ce projet de Business Intelligence sert a integrer des donnees bibliographiques (BUA/BUF) dans PMB, puis a les exploiter avec une interface web de recherche et de statistiques. Le flux est: nettoyage des donnees, import automatique vers PMB, reindexation PMB, puis consultation dans un dashboard PHP.
